@@ -48,6 +48,16 @@ func ValidateCreateRequest(req CreateRequest) *ValidationError {
 	return nil
 }
 
+// ValidateLookupIdentifier checks the single identifier carried in the path
+// of a single-item lookup. An illegal identifier rejects the whole request
+// (nothing is queried), exactly like an illegal field on create.
+func ValidateLookupIdentifier(name, value string) *ValidationError {
+	if !identPattern.MatchString(value) {
+		return &ValidationError{Fields: map[string]string{name: identRule}}
+	}
+	return nil
+}
+
 const (
 	batchRequiredRule = "line is required and must be a positive integer"
 	batchTypeRule     = "type must be one of chip_uid, board_serial or request_key"

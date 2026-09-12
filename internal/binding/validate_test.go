@@ -59,6 +59,38 @@ func TestValidateCreateRequest(t *testing.T) {
 	})
 }
 
+func TestValidateLookupIdentifier(t *testing.T) {
+	t.Run("legal identifiers pass", func(t *testing.T) {
+		assert.Nil(t, ValidateLookupIdentifier("chip_uid", "CHIP-9"))
+		assert.Nil(t, ValidateLookupIdentifier("request_key", "K"))
+		assert.Nil(t, ValidateLookupIdentifier("board_serial", strings.Repeat("B", 64)))
+	})
+
+	cases := map[string]string{
+		"empty":       "",
+		"lowercase":   "chip-9",
+		"underscore":  "CHIP_9",
+		"space":       "CHIP 9",
+		"slash":       "CHIP/9",
+		"non-ascii":   "CHIP-é",
+		"overlong":    strings.Repeat("C", 65),
+		"punctuation": "CHIP.9",
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			verr := ValidateLookupIdentifier("chip_uid", value)
+			require.NotNil(t, verr)
+			assert.Equal(t, map[string]string{"chip_uid": identRule}, verr.Fields)
+		})
+	}
+
+	t.Run("names the offending identifier", func(t *testing.T) {
+		verr := ValidateLookupIdentifier("request_key", "req-1")
+		require.NotNil(t, verr)
+		assert.Contains(t, verr.Fields, "request_key")
+	})
+}
+
 func intptr(n int) *int { return &n }
 
 func batchItemOn(line *int, typ, value string) BatchQueryItem {

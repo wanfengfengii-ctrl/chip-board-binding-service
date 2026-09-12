@@ -1,6 +1,7 @@
 package binding
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,27 +104,34 @@ func (h *Handler) Create(c *gin.Context) {
 
 // GetByRequestKey handles GET /api/v1/bindings/by-request-key/:request_key.
 func (h *Handler) GetByRequestKey(c *gin.Context) {
-	h.get(c, func() (Binding, error) {
-		return h.store.GetByRequestKey(c.Request.Context(), c.Param("request_key"))
-	})
+	h.get(c, "request_key", h.store.GetByRequestKey)
 }
 
 // GetByChipUID handles GET /api/v1/bindings/by-chip-uid/:chip_uid.
 func (h *Handler) GetByChipUID(c *gin.Context) {
-	h.get(c, func() (Binding, error) {
-		return h.store.GetByChipUID(c.Request.Context(), c.Param("chip_uid"))
-	})
+	h.get(c, "chip_uid", h.store.GetByChipUID)
 }
 
 // GetByBoardSerial handles GET /api/v1/bindings/by-board-serial/:board_serial.
 func (h *Handler) GetByBoardSerial(c *gin.Context) {
-	h.get(c, func() (Binding, error) {
-		return h.store.GetByBoardSerial(c.Request.Context(), c.Param("board_serial"))
-	})
+	h.get(c, "board_serial", h.store.GetByBoardSerial)
 }
 
-func (h *Handler) get(c *gin.Context, fetch func() (Binding, error)) {
-	b, err := fetch()
+// get resolves one single-item lookup. The path identifier is validated up
+// front: an illegal identifier rejects the whole request with 422 (nothing is
+// queried), exactly like an illegal field on create. A legal identifier that
+// matches no record is the ordinary 404.
+func (h *Handler) get(c *gin.Context, param string, fetch func(context.Context, string) (Binding, error)) {
+	id := c.Param(param)
+	if verr := ValidateLookupIdentifier(param, id); verr != nil {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "identifiers must be 1-64 characters of A-Z, 0-9 or '-'",
+			Details: verr.Fields,
+		})
+		return
+	}
+	b, err := fetch(c.Request.Context(), id)
 	if errors.Is(err, ErrNotFound) {
 		writeError(c, http.StatusNotFound, apiError{Code: CodeNotFound, Message: "binding not found"})
 		return

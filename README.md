@@ -44,6 +44,8 @@
 - `GET /api/v1/bindings/by-chip-uid/{chip_uid}`
 - `GET /api/v1/bindings/by-board-serial/{board_serial}`
 
+路径中的标识同样适用 1–64 位标识规则：非法标识（小写、下划线、超长等）整次拒绝，返回 `422 VALIDATION_FAILED`，不查询数据库；只有合法但未登记的标识才返回 `404 NOT_FOUND`。
+
 ### `POST /api/v1/bindings/batch-lookup`
 
 返修工位一次扫描多块板卡后的批量核对入口。提交 1–100 个带行号的查询项，每项按三种标识**三选一**：

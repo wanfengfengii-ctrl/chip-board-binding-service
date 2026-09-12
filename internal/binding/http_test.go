@@ -209,6 +209,45 @@ func TestValidationRejected(t *testing.T) {
 	env.assertCounts(t, 0, 0)
 }
 
+// TestLookupValidationRejected pins the single-item lookup contract: an
+// illegal path identifier rejects the whole request with 422 (nothing is
+// queried), while a legal identifier that matches no record stays a 404.
+func TestLookupValidationRejected(t *testing.T) {
+	env := newTestEnv(t)
+	status, _ := env.mustCreate(t, "REQ-LV", "CHIP-LV", "BOARD-LV")
+	require.Equal(t, http.StatusCreated, status)
+
+	cases := map[string]string{
+		"lowercase request key":  "/api/v1/bindings/by-request-key/req-lv",
+		"underscore chip uid":    "/api/v1/bindings/by-chip-uid/CHIP_LV",
+		"overlong board serial":  "/api/v1/bindings/by-board-serial/" + strings.Repeat("B", 65),
+		"lowercase board serial": "/api/v1/bindings/by-board-serial/board-lv",
+		"underscore request key": "/api/v1/bindings/by-request-key/REQ_LV",
+		"overlong chip uid":      "/api/v1/bindings/by-chip-uid/" + strings.Repeat("C", 65),
+		"space in chip uid":      "/api/v1/bindings/by-chip-uid/CHIP%20LV",
+		"non-ascii board serial": "/api/v1/bindings/by-board-serial/BOARD-%C3%A9",
+		"whitespace-only serial": "/api/v1/bindings/by-board-serial/%20",
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, raw := env.get(t, path)
+			require.Equal(t, http.StatusUnprocessableEntity, status, string(raw))
+			assert.Equal(t, "VALIDATION_FAILED", parseError(t, raw).Error.Code)
+		})
+	}
+
+	// Legal identifiers that match no record remain ordinary 404s.
+	for _, path := range []string{
+		"/api/v1/bindings/by-request-key/REQ-UNKNOWN",
+		"/api/v1/bindings/by-chip-uid/CHIP-UNKNOWN",
+		"/api/v1/bindings/by-board-serial/BOARD-UNKNOWN",
+	} {
+		status, raw := env.get(t, path)
+		require.Equal(t, http.StatusNotFound, status, path)
+		assert.Equal(t, "NOT_FOUND", parseError(t, raw).Error.Code, path)
+	}
+}
+
 func TestReplayReturnsOriginal(t *testing.T) {
 	env := newTestEnv(t)
 
