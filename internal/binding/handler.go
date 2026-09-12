@@ -3,8 +3,10 @@ package binding
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,10 +27,11 @@ type errorEnvelope struct {
 }
 
 type apiError struct {
-	Code    string            `json:"code"`
-	Message string            `json:"message"`
-	Field   string            `json:"field,omitempty"`
-	Details map[string]string `json:"details,omitempty"`
+	Code        string            `json:"code"`
+	Message     string            `json:"message"`
+	Field       string            `json:"field,omitempty"`
+	Details     map[string]string `json:"details,omitempty"`
+	FieldErrors []FieldError      `json:"field_errors,omitempty"`
 }
 
 // Handler exposes the binding service over HTTP.
@@ -130,6 +133,139 @@ func (h *Handler) get(c *gin.Context, fetch func() (Binding, error)) {
 		return
 	}
 	c.JSON(http.StatusOK, b)
+}
+
+// batchResponse is the payload of a successful batch lookup: results stay in
+// the exact order of the input items.
+type batchResponse struct {
+	Results []BatchItem `json:"results"`
+}
+
+// BatchLookup handles POST /api/v1/bindings/batch-lookup. A repair technician
+// submits one to one hundred numbered queries, each by chip UID, board serial
+// or request key. The whole batch is validated up front (422 on any shape
+// error); otherwise every item is resolved and answered independently.
+func (h *Handler) BatchLookup(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+	if err != nil {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:        CodeValidationFailed,
+			Message:     "body must be a JSON object smaller than 1 MiB",
+			FieldErrors: []FieldError{{Location: "", Message: "could not read request body"}},
+		})
+		return
+	}
+
+	// First decode only the envelope, rejecting trailing data, unknown
+	// top-level fields or a non-array queries value.
+	var envelope struct {
+		Queries []json.RawMessage `json:"queries"`
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&envelope); err != nil {
+		// A wrong-typed queries value pinpoints "queries"; every other
+		// malformed-envelope error concerns the whole body.
+		location := ""
+		message := "body must be a JSON object with a queries array of {line,type,value} items"
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			location = strings.ToLower(typeErr.Field)
+			message = fmt.Sprintf("%s has the wrong JSON type", location)
+		}
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:        CodeValidationFailed,
+			Message:     message,
+			FieldErrors: []FieldError{{Location: location, Message: message}},
+		})
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:        CodeValidationFailed,
+			Message:     "body must contain exactly one JSON object",
+			FieldErrors: []FieldError{{Location: "", Message: "body must contain exactly one JSON object"}},
+		})
+		return
+	}
+
+	// Decode each item on its own so a wrong field type or unknown field can
+	// be pinned to its exact array position.
+	req := BatchQueryRequest{Queries: make([]BatchQueryItem, len(envelope.Queries))}
+	var fieldErrs []FieldError
+	for i, raw := range envelope.Queries {
+		var item BatchQueryItem
+		itemDec := json.NewDecoder(strings.NewReader(string(raw)))
+		itemDec.DisallowUnknownFields()
+		if err := itemDec.Decode(&item); err != nil {
+			location := fmt.Sprintf("queries[%d]", i)
+			message := err.Error()
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &typeErr) {
+				if typeErr.Field != "" {
+					// The decoder reports the bare struct field ("line");
+					// prefix it with the item position.
+					field := strings.ToLower(typeErr.Field)
+					location = fmt.Sprintf("queries[%d].%s", i, field)
+					message = fmt.Sprintf("%s has the wrong JSON type (got %s)", field, typeErr.Value)
+				} else {
+					// The item itself is not a JSON object.
+					location = fmt.Sprintf("queries[%d]", i)
+					message = "query item must be a JSON object"
+				}
+			} else if name, ok := unknownFieldName(err); ok {
+				location = fmt.Sprintf("queries[%d].%s", i, name)
+			}
+			fieldErrs = append(fieldErrs, FieldError{Location: location, Message: message})
+			continue
+		}
+		if err := itemDec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			fieldErrs = append(fieldErrs, FieldError{
+				Location: fmt.Sprintf("queries[%d]", i),
+				Message:  "each query must be exactly one JSON object",
+			})
+			continue
+		}
+		req.Queries[i] = item
+	}
+
+	if len(fieldErrs) > 0 {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:        CodeValidationFailed,
+			Message:     "batch queries failed validation",
+			FieldErrors: fieldErrs,
+		})
+		return
+	}
+
+	queries, verr := ValidateBatchQueries(req)
+	if verr != nil {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:        CodeValidationFailed,
+			Message:     "batch queries failed validation",
+			FieldErrors: verr.FieldErrors,
+		})
+		return
+	}
+
+	items, err := h.store.BatchLookup(c.Request.Context(), queries)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, apiError{Code: CodeInternal, Message: "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, batchResponse{Results: items})
+}
+
+// unknownFieldName extracts the field name from a json "unknown field" error.
+func unknownFieldName(err error) (string, bool) {
+	msg := err.Error()
+	const prefix = `json: unknown field "`
+	if !strings.HasPrefix(msg, prefix) {
+		return "", false
+	}
+	name := strings.TrimPrefix(msg, prefix)
+	name, ok := strings.CutSuffix(name, `"`)
+	return name, ok
 }
 
 // Health handles GET /healthz.

@@ -168,6 +168,110 @@ func (s *Store) GetByBoardSerial(ctx context.Context, boardSerial string) (Bindi
 	return scanBinding(s.pool.QueryRow(ctx, selectBindingSQL+`WHERE r.board_serial = $1`, boardSerial))
 }
 
+// batchLookupSQL resolves any mix of the three identifiers in one query. Each
+// input row is tagged with its kind ('chip_uid', 'board_serial' or
+// 'request_key'); the JOIN finds at most one binding per row because each
+// identifier column is unique. Rows without a match yield nothing, exactly
+// like the single-item 404 lookups.
+const batchLookupSQL = `
+SELECT q.line, b.id, r.request_key, r.chip_uid, r.board_serial, r.created_at
+FROM unnest($1::bigint[], $2::text[], $3::text[]) AS q(line, kind, value)
+JOIN bindings b ON (
+	(q.kind = 'chip_uid'     AND b.chip_uid     = q.value) OR
+	(q.kind = 'board_serial' AND b.board_serial = q.value) OR
+	(q.kind = 'request_key'  AND b.request_key  = q.value)
+)
+JOIN requests r ON r.request_key = b.request_key`
+
+// BatchLookup resolves many identifiers against one read-only repeatable-read
+// transaction snapshot, so a batch under verification never mixes bindings
+// from different points in time even while other stations commit new bindings
+// concurrently.
+//
+// Identical (type, value) pairs are queried once and the result is restored
+// for every repeated row: the whole batch always costs the same fixed database
+// round trips (one BEGIN, one SELECT and one COMMIT) regardless of how many
+// items it carries, instead of one round trip per item. Nothing is written to
+// the request ledger. Results are returned in input order; misses carry
+// StatusNotFound while leaving the other items untouched.
+func (s *Store) BatchLookup(ctx context.Context, queries []BatchQuery) ([]BatchItem, error) {
+	items := make([]BatchItem, len(queries))
+	for i, q := range queries {
+		items[i] = BatchItem{Line: q.Line, Type: q.Type, Value: q.Value, Status: StatusNotFound}
+	}
+
+	// Deduplicate by (type, value); remember which input rows share each key.
+	type queryKey struct {
+		Type  LookupType
+		Value string
+	}
+	dedup := make(map[queryKey]struct{})
+	keyByLine := make(map[int64]queryKey, len(queries))
+	lines := make([]int64, 0, len(queries))
+	kinds := make([]string, 0, len(queries))
+	values := make([]string, 0, len(queries))
+	for _, q := range queries {
+		key := queryKey{q.Type, q.Value}
+		if _, seen := dedup[key]; seen {
+			continue
+		}
+		dedup[key] = struct{}{}
+		// The distinct key is tagged with the line of its first occurrence;
+		// the returned line maps straight back to that key.
+		keyByLine[int64(q.Line)] = key
+		lines = append(lines, int64(q.Line))
+		kinds = append(kinds, string(q.Type))
+		values = append(values, q.Value)
+	}
+
+	// A read-only repeatable-read transaction pins a single snapshot for the
+	// whole batch: it cannot take row locks that block concurrent binding
+	// creates, and a binding committed while the single batch SELECT is in
+	// flight is either visible to every item of the batch or to none.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, batchLookupSQL, lines, kinds, values)
+	if err != nil {
+		return nil, err
+	}
+	found := make(map[queryKey]Binding, len(values))
+	for rows.Next() {
+		var line int64
+		var b Binding
+		if err := rows.Scan(&line, &b.BindingID, &b.RequestKey, &b.ChipUID, &b.BoardSerial, &b.CreatedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		b.CreatedAt = b.CreatedAt.UTC()
+		found[keyByLine[line]] = b
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	// Restore the deduplicated result onto every input row, in input order.
+	for i := range items {
+		if b, ok := found[queryKey{items[i].Type, items[i].Value}]; ok {
+			binding := b
+			items[i].Status = StatusFound
+			items[i].Binding = &binding
+		}
+	}
+	return items, nil
+}
+
 func scanBinding(row pgx.Row) (Binding, error) {
 	var b Binding
 	err := row.Scan(&b.BindingID, &b.RequestKey, &b.ChipUID, &b.BoardSerial, &b.CreatedAt)

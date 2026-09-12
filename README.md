@@ -44,6 +44,45 @@
 - `GET /api/v1/bindings/by-chip-uid/{chip_uid}`
 - `GET /api/v1/bindings/by-board-serial/{board_serial}`
 
+### `POST /api/v1/bindings/batch-lookup`
+
+返修工位一次扫描多块板卡后的批量核对入口。提交 1–100 个带行号的查询项，每项按三种标识**三选一**：
+
+```json
+{
+  "queries": [
+    {"line": 1, "type": "chip_uid",     "value": "CHIP-9"},
+    {"line": 2, "type": "board_serial", "value": "BOARD-7"},
+    {"line": 3, "type": "request_key",  "value": "REQ-001"}
+  ]
+}
+```
+
+`type` 取值 `chip_uid` / `board_serial` / `request_key`；`value` 适用同样的 1–64 位标识规则；`line` 为正整数且同一批内不得重复。响应严格保持输入顺序，逐行回显 `line` / `type` / `value`：
+
+```json
+{
+  "results": [
+    {"line": 1, "type": "chip_uid", "value": "CHIP-9", "status": "FOUND",
+     "binding": {"binding_id": 1, "request_key": "REQ-001", "chip_uid": "CHIP-9", "board_serial": "BOARD-7", "created_at": "..."}},
+    {"line": 2, "type": "board_serial", "value": "BOARD-7", "status": "NOT_FOUND"}
+  ]
+}
+```
+
+- 命中返回 `FOUND` 并携带与单项查询一致的完整 Binding 结构；未命中返回 `NOT_FOUND`（单项缺失不影响其他行，也不写入请求账本）。
+- 整批查询在**同一个只读 REPEATABLE READ 事务快照**中完成，核对期间其他工位并发绑定不会让同一批结果来自不同时间点。
+- 相同 `(type, value)` 在存储层去重，只查询一次后还原到每个重复行；整批固定为 BEGIN / 单条 SELECT / COMMIT 三次数据库往返，**不随条目数线性增长**。
+- 校验失败整批返回 `422 VALIDATION_FAILED`，`error.field_errors[]` 用 `queries[i].field` 形式标出每个出错位置；数据库故障返回 `500 INTERNAL`。
+
+| 非法情形 | 位置 |
+|---|---|
+| `queries` 为空数组/缺失 | `queries` |
+| 超过 100 项 | `queries` |
+| 行号缺失、非正整数、重复 | `queries[i].line` |
+| 未知查询类型 | `queries[i].type` |
+| 非法标识 | `queries[i].value` |
+
 ### `GET /healthz`
 
 存活探针（含数据库连通性检查）。

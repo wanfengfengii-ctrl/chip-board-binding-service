@@ -22,6 +22,7 @@ const (
 	codeRequestKeyConflict = "REQUEST_KEY_CONFLICT"
 	codeDeviceAlreadyBound = "DEVICE_ALREADY_BOUND"
 	codeNotFound           = "NOT_FOUND"
+	codeInternal           = "INTERNAL"
 )
 
 type binding struct {
@@ -34,9 +35,45 @@ type binding struct {
 
 type errorEnvelope struct {
 	Error struct {
-		Code  string `json:"code"`
-		Field string `json:"field"`
+		Code        string       `json:"code"`
+		Field       string       `json:"field"`
+		FieldErrors []fieldError `json:"field_errors"`
 	} `json:"error"`
+}
+
+type fieldError struct {
+	Location string `json:"location"`
+	Message  string `json:"message"`
+}
+
+// batchQuery is one numbered item of a batch lookup request.
+type batchQuery struct {
+	Line  int    `json:"line"`
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type batchRequest struct {
+	Queries []batchQuery `json:"queries"`
+}
+
+type batchItem struct {
+	Line    int      `json:"line"`
+	Type    string   `json:"type"`
+	Value   string   `json:"value"`
+	Status  string   `json:"status"`
+	Binding *binding `json:"binding"`
+}
+
+type batchResponseBody struct {
+	Results []batchItem `json:"results"`
+}
+
+type batchResponse struct {
+	status  int
+	results []batchItem
+	errBody errorEnvelope
+	raw     []byte
 }
 
 type response struct {
@@ -75,6 +112,10 @@ func main() {
 	v.scenarioDeviceOccupied()
 	v.scenarioConcurrentStations()
 	v.scenarioValidationRejected()
+	v.scenarioBatchMixedWithMissing()
+	v.scenarioBatchDuplicatesReturnedPerRow()
+	v.scenarioBatchSnapshotUnderConcurrentWrites()
+	v.scenarioBatchValidationRejected()
 
 	fmt.Println()
 	if v.failures > 0 {
@@ -283,6 +324,258 @@ func (v *verifier) scenarioValidationRejected() {
 	v.check(unknown.status == http.StatusNotFound && unknown.errBody.Error.Code == codeNotFound, "unknown chip UID returns 404 NOT_FOUND")
 }
 
+// scenarioBatchMixedWithMissing is acceptance path 1: one batch mixes all
+// three identifier kinds and includes missing rows; results come back in
+// strict input order, each echoing its line and query, hits carry the full
+// Binding structure and misses are per-item NOT_FOUND.
+func (v *verifier) scenarioBatchMixedWithMissing() {
+	fmt.Println("scenario: batch lookup mixes chip UID, board serial and request key with missing rows")
+	key := "REQ-" + v.run + "-BMIX"
+	chip := "CHIP-" + v.run + "-BMIX"
+	board := "BOARD-" + v.run + "-BMIX"
+
+	first := v.create(key, chip, board)
+	v.check(first.status == http.StatusCreated, "setup create returns 201 (got %d: %s)", first.status, first.raw)
+
+	// Line numbers are intentionally out of order so the response order can
+	// only come from the input order.
+	res := v.batch([]batchQuery{
+		{Line: 7, Type: "chip_uid", Value: chip},
+		{Line: 2, Type: "board_serial", Value: "BOARD-" + v.run + "-MISSING"},
+		{Line: 9, Type: "request_key", Value: key},
+		{Line: 1, Type: "board_serial", Value: board},
+		{Line: 5, Type: "chip_uid", Value: "CHIP-" + v.run + "-MISSING"},
+	})
+	v.check(res.status == http.StatusOK, "batch returns 200 (got %d: %s)", res.status, res.raw)
+	v.check(len(res.results) == 5, "batch returns one result per input row (got %d)", len(res.results))
+
+	want := []struct {
+		line   int
+		typ    string
+		value  string
+		status string
+	}{
+		{7, "chip_uid", chip, "FOUND"},
+		{2, "board_serial", "BOARD-" + v.run + "-MISSING", "NOT_FOUND"},
+		{9, "request_key", key, "FOUND"},
+		{1, "board_serial", board, "FOUND"},
+		{5, "chip_uid", "CHIP-" + v.run + "-MISSING", "NOT_FOUND"},
+	}
+	for i, w := range want {
+		if i >= len(res.results) {
+			break
+		}
+		got := res.results[i]
+		v.check(got.Line == w.line && got.Type == w.typ && got.Value == w.value,
+			"row %d echoes line/type/value (%d/%s/%s)", i, got.Line, got.Type, got.Value)
+		v.check(got.Status == w.status, "row %d (line %d) is %s (got %s)", i, w.line, w.status, got.Status)
+		if w.status == "FOUND" {
+			v.check(got.Binding != nil && *got.Binding == first.binding,
+				"row %d hit returns the complete existing Binding", i)
+		} else {
+			v.check(got.Binding == nil, "row %d miss carries no binding", i)
+		}
+	}
+}
+
+// scenarioBatchDuplicatesReturnedPerRow is acceptance path 2: identical
+// conditions are answered on every row, in input order; missing duplicates are
+// NOT_FOUND on every row. (Storage deduplicates the identical condition to a
+// single database lookup; the batch endpoint tests pin that round-trip
+// guarantee.)
+func (v *verifier) scenarioBatchDuplicatesReturnedPerRow() {
+	fmt.Println("scenario: duplicate batch conditions answered per row")
+	key := "REQ-" + v.run + "-BDUP"
+	chip := "CHIP-" + v.run + "-BDUP"
+	board := "BOARD-" + v.run + "-BDUP"
+
+	first := v.create(key, chip, board)
+	v.check(first.status == http.StatusCreated, "setup create returns 201 (got %d: %s)", first.status, first.raw)
+
+	res := v.batch([]batchQuery{
+		{Line: 10, Type: "chip_uid", Value: chip},
+		{Line: 20, Type: "request_key", Value: "REQ-" + v.run + "-NEVER"},
+		{Line: 30, Type: "chip_uid", Value: chip},
+		{Line: 40, Type: "chip_uid", Value: chip},
+		{Line: 50, Type: "request_key", Value: "REQ-" + v.run + "-NEVER"},
+	})
+	v.check(res.status == http.StatusOK, "batch returns 200 (got %d: %s)", res.status, res.raw)
+
+	lines := []int{}
+	for _, r := range res.results {
+		lines = append(lines, r.Line)
+	}
+	v.check(fmt.Sprint(lines) == "[10 20 30 40 50]", "duplicate rows stay in strict input order (got %v)", lines)
+	for _, line := range []int{10, 30, 40} {
+		r := res.results[indexByLine(res.results, line)]
+		v.check(r.Status == "FOUND" && r.Binding != nil && *r.Binding == first.binding,
+			"duplicate hit on line %d returns the single resolved Binding", line)
+	}
+	for _, line := range []int{20, 50} {
+		r := res.results[indexByLine(res.results, line)]
+		v.check(r.Status == "NOT_FOUND" && r.Binding == nil,
+			"duplicate miss on line %d returns NOT_FOUND with no binding", line)
+	}
+}
+
+// scenarioBatchSnapshotUnderConcurrentWrites is acceptance path 3: while
+// other stations commit new bindings, each batch observes one snapshot — for
+// every queried row its request key, chip UID and board serial must be all
+// FOUND with one identical record or all NOT_FOUND, never a torn mix.
+func (v *verifier) scenarioBatchSnapshotUnderConcurrentWrites() {
+	fmt.Println("scenario: batch follows one snapshot while concurrent binds commit")
+	const rows = 32 // 32 * 3 identifiers = 96 items, inside the 100-item cap
+
+	// A station continuously commits new bindings.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	writers := 4
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < rows; i += writers {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				v.create(
+					fmt.Sprintf("REQ-%s-SNAP-%02d", v.run, i),
+					fmt.Sprintf("CHIP-%s-SNAP-%02d", v.run, i),
+					fmt.Sprintf("BOARD-%s-SNAP-%02d", v.run, i),
+				)
+				time.Sleep(time.Duration(i%3) * time.Millisecond)
+			}
+		}(w)
+	}
+
+	torn := false
+	checked := 0
+	// Fire batches through the commit window.
+	for round := 0; round < 16; round++ {
+		time.Sleep(time.Millisecond)
+		queries := make([]batchQuery, 0, 3*rows)
+		for kind := 0; kind < 3; kind++ {
+			for i := 0; i < rows; i++ {
+				line := kind*rows + i + 1
+				switch kind {
+				case 0:
+					queries = append(queries, batchQuery{line, "request_key", fmt.Sprintf("REQ-%s-SNAP-%02d", v.run, i)})
+				case 1:
+					queries = append(queries, batchQuery{line, "chip_uid", fmt.Sprintf("CHIP-%s-SNAP-%02d", v.run, i)})
+				default:
+					queries = append(queries, batchQuery{line, "board_serial", fmt.Sprintf("BOARD-%s-SNAP-%02d", v.run, i)})
+				}
+			}
+		}
+		res := v.batch(queries)
+		if res.status != http.StatusOK {
+			continue
+		}
+		byLine := map[int]batchItem{}
+		for _, r := range res.results {
+			byLine[r.Line] = r
+		}
+		for i := 0; i < rows; i++ {
+			rk := byLine[1+i]
+			rc := byLine[rows+1+i]
+			rb := byLine[2*rows+1+i]
+			found := 0
+			for _, r := range []batchItem{rk, rc, rb} {
+				if r.Status == "FOUND" {
+					found++
+				}
+			}
+			switch found {
+			case 3:
+				checked++
+				same := rk.Binding != nil && rc.Binding != nil && rb.Binding != nil &&
+					*rk.Binding == *rc.Binding && *rk.Binding == *rb.Binding
+				if !same {
+					torn = true
+				}
+			case 0:
+			default:
+				torn = true
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
+	v.check(!torn, "no row mixes FOUND/NOT_FOUND across its three identifiers while writes commit (single snapshot)")
+	v.check(checked > 0, "at least one committed row was observed all-three-ways mid-churn (got %d)", checked)
+
+	// Once writers finish, the final batch finds every row all three ways.
+	queries := make([]batchQuery, 0, 3*rows)
+	for i := 0; i < rows; i++ {
+		queries = append(queries,
+			batchQuery{3*i + 1, "request_key", fmt.Sprintf("REQ-%s-SNAP-%02d", v.run, i)},
+			batchQuery{3*i + 2, "chip_uid", fmt.Sprintf("CHIP-%s-SNAP-%02d", v.run, i)},
+			batchQuery{3*i + 3, "board_serial", fmt.Sprintf("BOARD-%s-SNAP-%02d", v.run, i)},
+		)
+	}
+	res := v.batch(queries)
+	v.check(res.status == http.StatusOK && len(res.results) == 3*rows, "post-churn batch resolves every row (got %d: %s)", res.status, res.raw)
+	missing := 0
+	for _, r := range res.results {
+		if r.Status != "FOUND" || r.Binding == nil {
+			missing++
+		}
+	}
+	v.check(missing == 0, "all %d post-churn items are FOUND with a Binding (missing %d)", 3*rows, missing)
+}
+
+// scenarioBatchValidationRejected pins the 422 contract and field positions
+// for every invalid batch shape; invalid batches never reach the database.
+func (v *verifier) scenarioBatchValidationRejected() {
+	fmt.Println("scenario: invalid batch shapes rejected with 422 and field positions")
+	cases := []struct {
+		name     string
+		queries  []batchQuery
+		rawBody  string
+		location string
+	}{
+		{"empty array", nil, `{"queries":[]}`, "queries"},
+		{"duplicate line numbers", []batchQuery{
+			{Line: 3, Type: "chip_uid", Value: "CHIP-X"},
+			{Line: 3, Type: "board_serial", Value: "BOARD-X"},
+		}, "", "queries[1].line"},
+		{"unknown query type", []batchQuery{{Line: 1, Type: "serial", Value: "BOARD-X"}}, "", "queries[0].type"},
+		{"illegal identifier", []batchQuery{{Line: 1, Type: "chip_uid", Value: "lowercase"}}, "", "queries[0].value"},
+		{"wrong json type for line", nil, `{"queries":[{"line":"1","type":"chip_uid","value":"CHIP-X"}]}`, "queries[0].line"},
+	}
+	for _, tc := range cases {
+		var res batchResponse
+		if tc.rawBody != "" {
+			res = v.batchRaw(tc.rawBody)
+		} else {
+			res = v.batch(tc.queries)
+		}
+		ok := res.status == http.StatusUnprocessableEntity &&
+			res.errBody.Error.Code == codeValidationFailed &&
+			len(res.errBody.Error.FieldErrors) > 0 &&
+			res.errBody.Error.FieldErrors[0].Location == tc.location
+		v.check(ok, "%s: 422 VALIDATION_FAILED at %s (got %d: %s)", tc.name, tc.location, res.status, res.raw)
+	}
+	over := make([]batchQuery, 101)
+	for i := range over {
+		over[i] = batchQuery{Line: i + 1, Type: "chip_uid", Value: "CHIP-X"}
+	}
+	res := v.batch(over)
+	v.check(res.status == http.StatusUnprocessableEntity && res.errBody.Error.FieldErrors[0].Location == "queries",
+		"more than 100 items: 422 at queries (got %d: %s)", res.status, res.raw)
+}
+
+func indexByLine(items []batchItem, line int) int {
+	for i := range items {
+		if items[i].Line == line {
+			return i
+		}
+	}
+	return -1
+}
+
 // race fires one request per payload from separate goroutines released at the
 // same instant, simulating stations on the line firing concurrently.
 func (v *verifier) race(payloads ...[3]string) []response {
@@ -340,6 +633,36 @@ func (v *verifier) create(key, chip, board string) response {
 
 func (v *verifier) get(path string) response {
 	return v.do(http.MethodGet, path, nil)
+}
+
+// batch posts one batch lookup request and parses either the result list or
+// the error envelope.
+func (v *verifier) batch(queries []batchQuery) batchResponse {
+	body, _ := json.Marshal(batchRequest{Queries: queries})
+	return v.batchRaw(string(body))
+}
+
+func (v *verifier) batchRaw(body string) batchResponse {
+	req, err := http.NewRequest(http.MethodPost, v.base+"/api/v1/bindings/batch-lookup", strings.NewReader(body))
+	if err != nil {
+		return batchResponse{status: -1, raw: []byte(err.Error())}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return batchResponse{status: -1, raw: []byte(err.Error())}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := batchResponse{status: resp.StatusCode, raw: raw}
+	if resp.StatusCode == http.StatusOK {
+		var parsed batchResponseBody
+		_ = json.Unmarshal(raw, &parsed)
+		out.results = parsed.Results
+	} else {
+		_ = json.Unmarshal(raw, &out.errBody)
+	}
+	return out
 }
 
 func (v *verifier) do(method, path string, body []byte) response {
