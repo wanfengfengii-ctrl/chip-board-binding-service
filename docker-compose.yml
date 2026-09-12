@@ -1,0 +1,52 @@
+name: binding-service
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: binding
+      POSTGRES_PASSWORD: binding
+      POSTGRES_DB: binding
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U binding -d binding"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # The database is deliberately not published on the host; only the api
+    # and verify services can reach it over the compose network.
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      DATABASE_URL: postgres://binding:binding@db:5432/binding?sslmode=disable
+      HTTP_ADDR: :8080
+    ports:
+      # Host port is overridable: API_PORT=9090 docker compose up api
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  verify:
+    build:
+      context: .
+      target: verify
+    environment:
+      API_BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    # One-shot acceptance service: runs its scenarios and exits.
+    # Inspect the result with: docker compose up --exit-code-from verify
+
+volumes:
+  db_data:
