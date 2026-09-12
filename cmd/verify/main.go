@@ -33,6 +33,19 @@ type binding struct {
 	CreatedAt   string `json:"created_at"`
 }
 
+// inspection mirrors the wire shape of one physical verification record.
+type inspection struct {
+	InspectionID   int64    `json:"inspection_id"`
+	ChipUID        string   `json:"chip_uid"`
+	BoardSerial    string   `json:"board_serial"`
+	Result         string   `json:"result"`
+	ChipBindingID  *int64   `json:"chip_binding_id"`
+	BoardBindingID *int64   `json:"board_binding_id"`
+	CreatedAt      string   `json:"created_at"`
+	ChipBinding    *binding `json:"chip_binding"`
+	BoardBinding   *binding `json:"board_binding"`
+}
+
 type errorEnvelope struct {
 	Error struct {
 		Code        string       `json:"code"`
@@ -83,6 +96,13 @@ type response struct {
 	raw     []byte
 }
 
+type inspectionResponse struct {
+	status     int
+	inspection inspection
+	errBody    errorEnvelope
+	raw        []byte
+}
+
 type verifier struct {
 	base     string
 	client   *http.Client
@@ -116,6 +136,8 @@ func main() {
 	v.scenarioBatchDuplicatesReturnedPerRow()
 	v.scenarioBatchSnapshotUnderConcurrentWrites()
 	v.scenarioBatchValidationRejected()
+	v.scenarioInspectionVerdicts()
+	v.scenarioInspectionReviewAndErrors()
 
 	fmt.Println()
 	if v.failures > 0 {
@@ -567,6 +589,170 @@ func (v *verifier) scenarioBatchValidationRejected() {
 		"more than 100 items: 422 at queries (got %d: %s)", res.status, res.raw)
 }
 
+// scenarioInspectionVerdicts drives a repair technician's physical
+// verification before teardown: the chip and board are scanned together and
+// the service must report whether they belong to the same registration
+// (CONSISTENT), to two different registrations (MISMATCH), only one side is
+// registered (PARTIAL) or neither is (UNREGISTERED). Every verdict is written
+// once as an immutable inspection record and re-readable by its id.
+func (v *verifier) scenarioInspectionVerdicts() {
+	fmt.Println("scenario: physical verification verdicts (consistent/mismatch/partial/unregistered)")
+
+	// Two independent registrations.
+	first := v.create("REQ-"+v.run+"-INS-A", "CHIP-"+v.run+"-INS-A", "BOARD-"+v.run+"-INS-A")
+	v.check(first.status == http.StatusCreated, "setup binding A returns 201 (got %d: %s)", first.status, first.raw)
+	second := v.create("REQ-"+v.run+"-INS-B", "CHIP-"+v.run+"-INS-B", "BOARD-"+v.run+"-INS-B")
+	v.check(second.status == http.StatusCreated, "setup binding B returns 201 (got %d: %s)", second.status, second.raw)
+
+	// Same registration on both sides: CONSISTENT, both summaries are binding A.
+	consistent := v.inspect("CHIP-"+v.run+"-INS-A", "BOARD-"+v.run+"-INS-A")
+	v.check(consistent.status == http.StatusCreated, "paired scan returns 201 (got %d: %s)", consistent.status, consistent.raw)
+	v.check(consistent.inspection.Result == "CONSISTENT", "same binding judged CONSISTENT (got %q)", consistent.inspection.Result)
+	v.check(consistent.inspection.ChipBindingID != nil && consistent.inspection.BoardBindingID != nil &&
+		*consistent.inspection.ChipBindingID == *consistent.inspection.BoardBindingID &&
+		*consistent.inspection.ChipBindingID == first.binding.BindingID,
+		"CONSISTENT record references the one shared binding id")
+	v.check(consistent.inspection.ChipBinding != nil && *consistent.inspection.ChipBinding == first.binding &&
+		consistent.inspection.BoardBinding != nil && *consistent.inspection.BoardBinding == first.binding,
+		"CONSISTENT response carries the matched binding summary on both sides")
+
+	// Chip from binding A with board from binding B: MISMATCH.
+	mismatch := v.inspect("CHIP-"+v.run+"-INS-A", "BOARD-"+v.run+"-INS-B")
+	v.check(mismatch.status == http.StatusCreated, "cross scan returns 201 (got %d: %s)", mismatch.status, mismatch.raw)
+	v.check(mismatch.inspection.Result == "MISMATCH", "cross bindings judged MISMATCH (got %q)", mismatch.inspection.Result)
+	v.check(mismatch.inspection.ChipBindingID != nil && mismatch.inspection.BoardBindingID != nil &&
+		*mismatch.inspection.ChipBindingID == first.binding.BindingID &&
+		*mismatch.inspection.BoardBindingID == second.binding.BindingID,
+		"MISMATCH record keeps each side's own binding id")
+	v.check(mismatch.inspection.ChipBinding != nil && *mismatch.inspection.ChipBinding == first.binding &&
+		mismatch.inspection.BoardBinding != nil && *mismatch.inspection.BoardBinding == second.binding,
+		"MISMATCH response carries each side's own binding summary")
+
+	// Only one side registered: PARTIAL, in both directions.
+	chipOnly := v.inspect("CHIP-"+v.run+"-INS-A", "BOARD-"+v.run+"-INS-MISSING")
+	v.check(chipOnly.inspection.Result == "PARTIAL" && chipOnly.status == http.StatusCreated,
+		"registered chip with unregistered board judged PARTIAL (got %d/%q)", chipOnly.status, chipOnly.inspection.Result)
+	v.check(chipOnly.inspection.ChipBindingID != nil && *chipOnly.inspection.ChipBindingID == first.binding.BindingID &&
+		chipOnly.inspection.BoardBindingID == nil && chipOnly.inspection.BoardBinding == nil,
+		"chip-side PARTIAL carries only the chip binding")
+	boardOnly := v.inspect("CHIP-"+v.run+"-INS-MISSING", "BOARD-"+v.run+"-INS-B")
+	v.check(boardOnly.inspection.Result == "PARTIAL" && boardOnly.status == http.StatusCreated,
+		"unregistered chip with registered board judged PARTIAL (got %d/%q)", boardOnly.status, boardOnly.inspection.Result)
+	v.check(boardOnly.inspection.BoardBindingID != nil && *boardOnly.inspection.BoardBindingID == second.binding.BindingID &&
+		boardOnly.inspection.ChipBindingID == nil && boardOnly.inspection.ChipBinding == nil,
+		"board-side PARTIAL carries only the board binding")
+
+	// Neither side registered: still an auditable record, UNREGISTERED.
+	unregistered := v.inspect("CHIP-"+v.run+"-INS-GHOST", "BOARD-"+v.run+"-INS-GHOST")
+	v.check(unregistered.status == http.StatusCreated && unregistered.inspection.Result == "UNREGISTERED",
+		"two unregistered identifiers judged UNREGISTERED (got %d/%q)", unregistered.status, unregistered.inspection.Result)
+	v.check(unregistered.inspection.ChipBindingID == nil && unregistered.inspection.BoardBindingID == nil &&
+		unregistered.inspection.ChipBinding == nil && unregistered.inspection.BoardBinding == nil,
+		"UNREGISTERED record carries no binding references")
+
+	// Every verdict is persistent and comes back unchanged.
+	for name, res := range map[string]inspectionResponse{
+		"consistent":    consistent,
+		"mismatch":      mismatch,
+		"chip partial":  chipOnly,
+		"board partial": boardOnly,
+		"unregistered":  unregistered,
+	} {
+		got := v.getInspection(res.inspection.InspectionID)
+		v.check(got.status == http.StatusOK && inspectionsEqual(got.inspection, res.inspection),
+			"%s inspection %d is re-readable with the original verdict and summaries", name, res.inspection.InspectionID)
+	}
+}
+
+// scenarioInspectionReviewAndErrors covers the review endpoint's error
+// contract and the immutability of stored inspections: invalid path ids and
+// invalid scan payloads are rejected as validation errors without writing a
+// record, legal but unknown ids are 404, and inspection creation never alters
+// the binding ledger.
+func (v *verifier) scenarioInspectionReviewAndErrors() {
+	fmt.Println("scenario: inspection review, validation and immutability")
+
+	first := v.create("REQ-"+v.run+"-INR", "CHIP-"+v.run+"-INR", "BOARD-"+v.run+"-INR")
+	v.check(first.status == http.StatusCreated, "setup binding returns 201 (got %d: %s)", first.status, first.raw)
+
+	created := v.inspect("CHIP-"+v.run+"-INR", "BOARD-"+v.run+"-INR")
+	v.check(created.status == http.StatusCreated && created.inspection.Result == "CONSISTENT",
+		"setup inspection is CONSISTENT (got %d: %s)", created.status, created.raw)
+
+	// Non-positive-integer path ids are validation errors, not 404s.
+	for _, bad := range []string{"0", "-1", "abc", "1.5", "+1", "01"} {
+		res := v.get("/api/v1/inspections/" + bad)
+		v.check(res.status == http.StatusUnprocessableEntity && res.errBody.Error.Code == codeValidationFailed,
+			"path id %q rejected with 422 VALIDATION_FAILED (got %d: %s)", bad, res.status, res.raw)
+	}
+
+	// A legal id without a record is the ordinary 404.
+	missing := v.getInspection(999999999)
+	v.check(missing.status == http.StatusNotFound && missing.errBody.Error.Code == codeNotFound,
+		"legal but unknown inspection id returns 404 NOT_FOUND (got %d: %s)", missing.status, missing.raw)
+
+	// Invalid scan payloads are 422 and must not create records.
+	badBodies := []string{
+		`{"chip_uid":"chip-lower","board_serial":"BOARD-1"}`,
+		`{"chip_uid":"CHIP_1","board_serial":"BOARD-1"}`,
+		`{"chip_uid":"CHIP-1","board_serial":""}`,
+		`{"chip_uid":"CHIP-1"}`,
+		`{}`,
+		`{"chip_uid":7,"board_serial":"BOARD-1"}`,
+		`{"chip_uid":"CHIP-1","board_serial":"BOARD-1","extra":true}`,
+		`{`,
+	}
+	for _, body := range badBodies {
+		res := v.inspectRaw(body)
+		v.check(res.status == http.StatusUnprocessableEntity && res.errBody.Error.Code == codeValidationFailed,
+			"invalid scan payload rejected with 422 (got %d: %s)", res.status, res.raw)
+	}
+
+	// The stored record is unchanged by all the rejected attempts, and the
+	// binding ledger is untouched by inspection activity (one setup binding).
+	review := v.getInspection(created.inspection.InspectionID)
+	v.check(review.status == http.StatusOK && inspectionsEqual(review.inspection, created.inspection),
+		"recorded inspection remains unchanged and reviewable")
+	stillBound := v.get("/api/v1/bindings/by-chip-uid/CHIP-" + v.run + "-INR")
+	v.check(stillBound.status == http.StatusOK && stillBound.binding == first.binding,
+		"inspections do not modify existing bindings")
+}
+
+// inspectionsEqual compares two inspection records deeply: the embedded
+// binding summaries are pointers, so a plain == would compare addresses even
+// when the payloads are byte-identical.
+func inspectionsEqual(a, b inspection) bool {
+	if a.InspectionID != b.InspectionID || a.ChipUID != b.ChipUID ||
+		a.BoardSerial != b.BoardSerial || a.Result != b.Result || a.CreatedAt != b.CreatedAt {
+		return false
+	}
+	if (a.ChipBindingID == nil) != (b.ChipBindingID == nil) {
+		return false
+	}
+	if a.ChipBindingID != nil && *a.ChipBindingID != *b.ChipBindingID {
+		return false
+	}
+	if (a.BoardBindingID == nil) != (b.BoardBindingID == nil) {
+		return false
+	}
+	if a.BoardBindingID != nil && *a.BoardBindingID != *b.BoardBindingID {
+		return false
+	}
+	if (a.ChipBinding == nil) != (b.ChipBinding == nil) {
+		return false
+	}
+	if a.ChipBinding != nil && *a.ChipBinding != *b.ChipBinding {
+		return false
+	}
+	if (a.BoardBinding == nil) != (b.BoardBinding == nil) {
+		return false
+	}
+	if a.BoardBinding != nil && *a.BoardBinding != *b.BoardBinding {
+		return false
+	}
+	return true
+}
+
 func indexByLine(items []batchItem, line int) int {
 	for i := range items {
 		if items[i].Line == line {
@@ -633,6 +819,60 @@ func (v *verifier) create(key, chip, board string) response {
 
 func (v *verifier) get(path string) response {
 	return v.do(http.MethodGet, path, nil)
+}
+
+// inspect posts one physical verification (a chip and board scanned
+// together) and parses either the inspection record or the error envelope.
+func (v *verifier) inspect(chip, board string) inspectionResponse {
+	body, _ := json.Marshal(map[string]string{
+		"chip_uid":     chip,
+		"board_serial": board,
+	})
+	return v.inspectRaw(string(body))
+}
+
+// inspectRaw posts a raw inspection body without failing the run, so malformed
+// payloads can be tested too.
+func (v *verifier) inspectRaw(body string) inspectionResponse {
+	req, err := http.NewRequest(http.MethodPost, v.base+"/api/v1/inspections", strings.NewReader(body))
+	if err != nil {
+		return inspectionResponse{status: -1, raw: []byte(err.Error())}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return inspectionResponse{status: -1, raw: []byte(err.Error())}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := inspectionResponse{status: resp.StatusCode, raw: raw}
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		_ = json.Unmarshal(raw, &out.inspection)
+	} else {
+		_ = json.Unmarshal(raw, &out.errBody)
+	}
+	return out
+}
+
+// getInspection fetches one recorded inspection for technician review.
+func (v *verifier) getInspection(id int64) inspectionResponse {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/v1/inspections/%d", v.base, id), nil)
+	if err != nil {
+		return inspectionResponse{status: -1, raw: []byte(err.Error())}
+	}
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return inspectionResponse{status: -1, raw: []byte(err.Error())}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := inspectionResponse{status: resp.StatusCode, raw: raw}
+	if resp.StatusCode == http.StatusOK {
+		_ = json.Unmarshal(raw, &out.inspection)
+	} else {
+		_ = json.Unmarshal(raw, &out.errBody)
+	}
+	return out
 }
 
 // batch posts one batch lookup request and parses either the result list or

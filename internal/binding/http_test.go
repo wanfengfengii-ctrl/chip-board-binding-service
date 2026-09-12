@@ -76,7 +76,7 @@ type testEnv struct {
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	pool, srv := startApp(t, testDSN(t))
-	_, err := pool.Exec(context.Background(), `TRUNCATE requests, bindings`)
+	_, err := pool.Exec(context.Background(), `TRUNCATE inspections, requests, bindings`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		srv.Close()
@@ -130,6 +130,23 @@ func (e *testEnv) assertCounts(t *testing.T, requests, bindings int64) {
 	require.NoError(t, e.pool.QueryRow(context.Background(), `SELECT count(*) FROM bindings`).Scan(&bc))
 	assert.Equal(t, requests, rc, "request ledger rows")
 	assert.Equal(t, bindings, bc, "binding rows")
+}
+
+func (e *testEnv) assertInspectionCount(t *testing.T, want int64) {
+	t.Helper()
+	var count int64
+	require.NoError(t, e.pool.QueryRow(context.Background(), `SELECT count(*) FROM inspections`).Scan(&count))
+	assert.Equal(t, want, count, "inspection rows")
+}
+
+func (e *testEnv) post(t *testing.T, path, body string) (int, []byte) {
+	t.Helper()
+	resp, err := http.Post(e.server.URL+path, "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, raw
 }
 
 func parseBinding(t *testing.T, raw []byte) bindingJSON {
@@ -485,7 +502,7 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 
 	// First incarnation of the service: create a binding, then shut down.
 	pool1, srv1 := startApp(t, dsn)
-	_, err := pool1.Exec(ctx, `TRUNCATE requests, bindings`)
+	_, err := pool1.Exec(ctx, `TRUNCATE inspections, requests, bindings`)
 	require.NoError(t, err)
 	env1 := &testEnv{t: t, pool: pool1, server: srv1}
 

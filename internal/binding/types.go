@@ -85,3 +85,59 @@ type BatchItem struct {
 	Status  LookupStatus `json:"status"`
 	Binding *Binding     `json:"binding,omitempty"`
 }
+
+// InspectionRequest is the payload of POST /api/v1/inspections. Before
+// teardown a repair technician scans a chip and the board it is soldered to in
+// one physical verification; ChipUID and BoardSerial carry the two scanned
+// identifiers.
+type InspectionRequest struct {
+	ChipUID     string `json:"chip_uid"`
+	BoardSerial string `json:"board_serial"`
+}
+
+// InspectionResult is the verdict of a physical verification, derived solely
+// from the bindings the two scanned identifiers hit.
+type InspectionResult string
+
+const (
+	// ResultConsistent means both identifiers hit the same binding.
+	ResultConsistent InspectionResult = "CONSISTENT"
+	// ResultMismatch means both identifiers hit bindings, but different ones.
+	ResultMismatch InspectionResult = "MISMATCH"
+	// ResultPartial means exactly one of the two identifiers hit a binding.
+	ResultPartial InspectionResult = "PARTIAL"
+	// ResultUnregistered means neither identifier is registered.
+	ResultUnregistered InspectionResult = "UNREGISTERED"
+)
+
+// Inspection is the immutable record of one physical verification. It stores
+// the scanned values and the verdict together with the nullable IDs of the
+// bindings each side resolved to (nil when that side was unregistered), so a
+// technician reviewing an old inspection sees exactly what was decided then.
+type Inspection struct {
+	InspectionID   int64            `json:"inspection_id"`
+	ChipUID        string           `json:"chip_uid"`
+	BoardSerial    string           `json:"board_serial"`
+	Result         InspectionResult `json:"result"`
+	ChipBindingID  *int64           `json:"chip_binding_id"`
+	BoardBindingID *int64           `json:"board_binding_id"`
+	CreatedAt      time.Time        `json:"created_at"`
+	ChipBinding    *Binding         `json:"chip_binding,omitempty"`
+	BoardBinding   *Binding         `json:"board_binding,omitempty"`
+}
+
+// ValidateInspectionRequest checks the two scanned identifiers with the same
+// 1-64 character identifier rule as every other endpoint.
+func ValidateInspectionRequest(req InspectionRequest) *ValidationError {
+	fields := make(map[string]string)
+	if !identPattern.MatchString(req.ChipUID) {
+		fields["chip_uid"] = identRule
+	}
+	if !identPattern.MatchString(req.BoardSerial) {
+		fields["board_serial"] = identRule
+	}
+	if len(fields) > 0 {
+		return &ValidationError{Fields: fields}
+	}
+	return nil
+}

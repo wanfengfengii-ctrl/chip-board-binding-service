@@ -196,3 +196,64 @@ func repeatItems(n int) []BatchQueryItem {
 	}
 	return items
 }
+
+func TestValidateInspectionRequest(t *testing.T) {
+	t.Run("valid request passes", func(t *testing.T) {
+		assert.Nil(t, ValidateInspectionRequest(InspectionRequest{ChipUID: "CHIP-9", BoardSerial: "BOARD-7"}))
+	})
+
+	t.Run("boundary lengths pass", func(t *testing.T) {
+		assert.Nil(t, ValidateInspectionRequest(InspectionRequest{
+			ChipUID:     strings.Repeat("C", 64),
+			BoardSerial: "B",
+		}))
+	})
+
+	cases := map[string]struct {
+		req   InspectionRequest
+		field string
+	}{
+		"empty chip uid":         {InspectionRequest{ChipUID: "", BoardSerial: "BOARD-7"}, "chip_uid"},
+		"lowercase chip uid":     {InspectionRequest{ChipUID: "chip-9", BoardSerial: "BOARD-7"}, "chip_uid"},
+		"underscore chip uid":    {InspectionRequest{ChipUID: "CHIP_9", BoardSerial: "BOARD-7"}, "chip_uid"},
+		"overlong chip uid":      {InspectionRequest{ChipUID: strings.Repeat("C", 65), BoardSerial: "BOARD-7"}, "chip_uid"},
+		"empty board serial":     {InspectionRequest{ChipUID: "CHIP-9", BoardSerial: ""}, "board_serial"},
+		"lowercase board serial": {InspectionRequest{ChipUID: "CHIP-9", BoardSerial: "board-7"}, "board_serial"},
+		"non-ascii board serial": {InspectionRequest{ChipUID: "CHIP-9", BoardSerial: "BOARD-é"}, "board_serial"},
+		"overlong board serial":  {InspectionRequest{ChipUID: "CHIP-9", BoardSerial: strings.Repeat("B", 65)}, "board_serial"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			verr := ValidateInspectionRequest(tc.req)
+			require.NotNil(t, verr)
+			assert.Contains(t, verr.Fields, tc.field)
+		})
+	}
+
+	t.Run("both fields invalid at once", func(t *testing.T) {
+		verr := ValidateInspectionRequest(InspectionRequest{})
+		require.NotNil(t, verr)
+		assert.Len(t, verr.Fields, 2)
+	})
+}
+
+func TestVerdict(t *testing.T) {
+	id := func(n int64) *int64 { return &n }
+	cases := []struct {
+		name  string
+		chip  *int64
+		board *int64
+		want  InspectionResult
+	}{
+		{"both sides same binding", id(1), id(1), ResultConsistent},
+		{"sides hit different bindings", id(1), id(2), ResultMismatch},
+		{"only chip side hit", id(1), nil, ResultPartial},
+		{"only board side hit", nil, id(2), ResultPartial},
+		{"neither side hit", nil, nil, ResultUnregistered},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, verdict(tc.chip, tc.board))
+		})
+	}
+}

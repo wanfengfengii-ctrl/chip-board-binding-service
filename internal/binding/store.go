@@ -13,6 +13,9 @@ import (
 // ErrNotFound is returned when no binding matches the requested identifier.
 var ErrNotFound = errors.New("binding not found")
 
+// ErrInspectionNotFound is returned when no inspection matches the requested id.
+var ErrInspectionNotFound = errors.New("inspection not found")
+
 // Outcome describes how a create attempt resolved.
 type Outcome string
 
@@ -283,6 +286,167 @@ func scanBinding(row pgx.Row) (Binding, error) {
 	}
 	b.CreatedAt = b.CreatedAt.UTC()
 	return b, nil
+}
+
+// resolveInspectionSQL resolves both scanned identifiers in a single
+// statement. The two LATERAL sub-selects read the bindings/requests tables on
+// one snapshot (chip side first, board side second); a side without a
+// registration yields null columns. Each sub-select returns at most one row
+// because chip_uid and board_serial are unique in bindings.
+const resolveInspectionSQL = `
+SELECT
+    cb.id, cb.request_key, cb.chip_uid, cb.board_serial, cb.created_at,
+    bb.id, bb.request_key, bb.chip_uid, bb.board_serial, bb.created_at
+FROM (SELECT 1) AS seed
+LEFT JOIN LATERAL (
+    SELECT b.id, r.request_key, r.chip_uid, r.board_serial, r.created_at
+    FROM bindings b
+    JOIN requests r ON r.request_key = b.request_key
+    WHERE b.chip_uid = $1
+) cb ON TRUE
+LEFT JOIN LATERAL (
+    SELECT b.id, r.request_key, r.chip_uid, r.board_serial, r.created_at
+    FROM bindings b
+    JOIN requests r ON r.request_key = b.request_key
+    WHERE b.board_serial = $2
+) bb ON TRUE`
+
+const insertInspectionSQL = `
+INSERT INTO inspections (chip_uid, board_serial, result, chip_binding_id, board_binding_id)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, created_at`
+
+// selectInspectionSQL reads one stored inspection together with a summary of
+// the binding each side hit at decision time. Missing sides (null foreign
+// keys) yield null summary columns.
+const selectInspectionSQL = `
+SELECT
+    i.id, i.chip_uid, i.board_serial, i.result,
+    i.chip_binding_id, i.board_binding_id, i.created_at,
+    cb.id, cr.request_key, cr.chip_uid, cr.board_serial, cr.created_at,
+    bb.id, br.request_key, br.chip_uid, br.board_serial, br.created_at
+FROM inspections i
+LEFT JOIN bindings cb ON cb.id = i.chip_binding_id
+LEFT JOIN requests cr ON cr.request_key = cb.request_key
+LEFT JOIN bindings bb ON bb.id = i.board_binding_id
+LEFT JOIN requests br ON br.request_key = bb.request_key
+WHERE i.id = $1`
+
+// CreateInspection resolves the scanned chip UID and board serial against the
+// existing bindings and persists the verdict in one transaction. The two
+// sides are resolved in a single statement (one snapshot), so the verdict can
+// never mix bindings from different points in time. The inspection row is
+// inserted once and never updated or deleted afterwards.
+func (s *Store) CreateInspection(ctx context.Context, req InspectionRequest) (Inspection, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Inspection{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var chipID, boardID *int64
+	var chipKey, chipUID, chipBoard *string
+	var chipCreatedAt *time.Time
+	var boardKey, boardChip, boardSerial *string
+	var boardCreatedAt *time.Time
+	err = tx.QueryRow(ctx, resolveInspectionSQL, req.ChipUID, req.BoardSerial).Scan(
+		&chipID, &chipKey, &chipUID, &chipBoard, &chipCreatedAt,
+		&boardID, &boardKey, &boardChip, &boardSerial, &boardCreatedAt,
+	)
+	if err != nil {
+		return Inspection{}, err
+	}
+
+	result := verdict(chipID, boardID)
+
+	var inspectionID int64
+	var createdAt time.Time
+	err = tx.QueryRow(ctx, insertInspectionSQL,
+		req.ChipUID, req.BoardSerial, string(result), chipID, boardID,
+	).Scan(&inspectionID, &createdAt)
+	if err != nil {
+		return Inspection{}, err
+	}
+
+	insp, err := scanInspection(tx.QueryRow(ctx, selectInspectionSQL, inspectionID))
+	if err != nil {
+		return Inspection{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Inspection{}, err
+	}
+	return insp, nil
+}
+
+// verdict derives the inspection outcome from the bindings the two sides hit:
+// equal binding ids are CONSISTENT, two different ids are MISMATCH, exactly
+// one hit is PARTIAL and neither hit is UNREGISTERED.
+func verdict(chipBindingID, boardBindingID *int64) InspectionResult {
+	switch {
+	case chipBindingID != nil && boardBindingID != nil:
+		if *chipBindingID == *boardBindingID {
+			return ResultConsistent
+		}
+		return ResultMismatch
+	case chipBindingID != nil || boardBindingID != nil:
+		return ResultPartial
+	default:
+		return ResultUnregistered
+	}
+}
+
+// GetInspection returns a previously recorded inspection for a repair
+// technician reviewing the original verdict.
+func (s *Store) GetInspection(ctx context.Context, inspectionID int64) (Inspection, error) {
+	return scanInspection(s.pool.QueryRow(ctx, selectInspectionSQL, inspectionID))
+}
+
+// scanInspection scans the 17 columns of selectInspectionSQL. The stored
+// binding id columns and all summary columns are nullable; a nil summary
+// means that side was unregistered.
+func scanInspection(row pgx.Row) (Inspection, error) {
+	var in Inspection
+	var result string
+	var chipID, boardID *int64
+	var chipKey, chipUID, chipBoard *string
+	var chipCreatedAt *time.Time
+	var boardKey, boardChip, boardSerial *string
+	var boardCreatedAt *time.Time
+	err := row.Scan(
+		&in.InspectionID, &in.ChipUID, &in.BoardSerial, &result,
+		&chipID, &boardID, &in.CreatedAt,
+		&chipID, &chipKey, &chipUID, &chipBoard, &chipCreatedAt,
+		&boardID, &boardKey, &boardChip, &boardSerial, &boardCreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Inspection{}, ErrInspectionNotFound
+	}
+	if err != nil {
+		return Inspection{}, err
+	}
+	in.Result = InspectionResult(result)
+	in.ChipBindingID = chipID
+	in.BoardBindingID = boardID
+	in.CreatedAt = in.CreatedAt.UTC()
+	if chipID != nil {
+		in.ChipBinding = &Binding{
+			BindingID:   *chipID,
+			RequestKey:  *chipKey,
+			ChipUID:     *chipUID,
+			BoardSerial: *chipBoard,
+			CreatedAt:   chipCreatedAt.UTC(),
+		}
+	}
+	if boardID != nil {
+		in.BoardBinding = &Binding{
+			BindingID:   *boardID,
+			RequestKey:  *boardKey,
+			ChipUID:     *boardChip,
+			BoardSerial: *boardSerial,
+			CreatedAt:   boardCreatedAt.UTC(),
+		}
+	}
+	return in, nil
 }
 
 // Ping reports whether the database is reachable.

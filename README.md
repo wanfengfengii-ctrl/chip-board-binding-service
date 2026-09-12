@@ -21,6 +21,8 @@
 
 并发争用时，`INSERT ... ON CONFLICT DO NOTHING` 会等待在飞事务落定：赢家提交后，同键重放读到原始记录；`bindings` 上的唯一冲突则精确指出哪个器件已被占用。三张表的标识列还有 `CHECK (col ~ '^[A-Z0-9-]{1,64}$')` 兜底，应用层校验之外数据库也拒绝非法标识。
 
+`0002_inspections.sql` 增加返修拆机前的实物核验账本 `inspections`：保存扫描值 `chip_uid` / `board_serial`、判定结果 `result`、两侧可空的绑定编号（外键到 `bindings.id`）和创建时间。该表**只写不改**——除应用层不提供更新/删除入口外，数据库触发器 `inspections_no_update` / `inspections_no_delete` 会直接拒绝任何 UPDATE 或 DELETE。
+
 ## API
 
 三个标识（`request_key`、`chip_uid`、`board_serial`）均为 1–64 位 ASCII 大写字母、数字或连字符；任一字段非法 → 整次 `422`，不入库。
@@ -89,6 +91,53 @@
 
 存活探针（含数据库连通性检查）。
 
+## 返修实物核验
+
+返修人员拆机前同时扫描芯片 UID 与板卡序列号，服务在**一次数据库事务**中按现有绑定关系解析两端，并把这次实物核验作为不可修改的检查记录保存。
+
+### `POST /api/v1/inspections`
+
+```json
+{ "chip_uid": "CHIP-9", "board_serial": "BOARD-7" }
+```
+
+两个标识适用同样的 1–64 位标识规则；非法标识整次 `422 VALIDATION_FAILED`，不落库。事务先在同一快照中解析两侧命中的绑定（一条 SQL 的两个 LATERAL 子查询），再按命中关系写入核验记录：
+
+| 判定 | 条件 |
+|---|---|
+| `CONSISTENT` | 两侧都命中且是**同一条**绑定 |
+| `MISMATCH` | 两侧都命中但是**不同**绑定（交叉绑定） |
+| `PARTIAL` | 仅一侧命中 |
+| `UNREGISTERED` | 两侧都未登记 |
+
+`201` 响应与记录结构：
+
+```json
+{
+  "inspection_id": 1,
+  "chip_uid": "CHIP-9",
+  "board_serial": "BOARD-7",
+  "result": "MISMATCH",
+  "chip_binding_id": 1,
+  "board_binding_id": 2,
+  "created_at": "...",
+  "chip_binding":  { "binding_id": 1, "request_key": "REQ-001", "chip_uid": "CHIP-9", "board_serial": "BOARD-1", "created_at": "..." },
+  "board_binding": { "binding_id": 2, "request_key": "REQ-002", "chip_uid": "CHIP-2", "board_serial": "BOARD-7", "created_at": "..." }
+}
+```
+
+- `chip_binding_id` / `board_binding_id` 两侧可空（未命中为 `null`）；命中时额外返回该侧命中绑定的完整摘要 `chip_binding` / `board_binding`，未命中字段省略。
+- 核验只读现有绑定并追加核验记录，不写 `requests` 账本、不改变任何既有绑定。
+- 解析或保存失败返回 `500 INTERNAL` 错误信封，事务回滚不留记录。
+
+### `GET /api/v1/inspections/{inspection_id}`
+
+返修人员复核原始判定，返回与创建时一致的记录结构。
+
+- 路径段必须是正整数；`0`、负数、小数、带符号或非数字一律 `422 VALIDATION_FAILED`，不查询数据库。
+- 合法但不存在的编号返回 `404 NOT_FOUND`。
+- 记录写入后不提供更新或删除入口，数据库触发器同样拒绝任何 UPDATE / DELETE。
+
 ## 运行（Docker Compose）
 
 ```bash
@@ -100,7 +149,7 @@ API_PORT=9090 docker compose up api    # API_PORT 覆盖宿主端口
 
 ## 验收
 
-`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝。每次运行使用唯一标识后缀，可重复执行。
+`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝，以及返修实物核验的四种判定（同一绑定 `CONSISTENT`、交叉绑定 `MISMATCH`、单侧命中 `PARTIAL`、双侧未命中 `UNREGISTERED`）与复核/错误契约。每次运行使用唯一标识后缀，可重复执行。
 
 ```bash
 docker compose up --build --exit-code-from verify

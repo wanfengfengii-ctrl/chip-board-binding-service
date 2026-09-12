@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -262,6 +263,77 @@ func (h *Handler) BatchLookup(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, batchResponse{Results: items})
+}
+
+// CreateInspection handles POST /api/v1/inspections. A repair technician
+// scans a chip UID and a board serial together before teardown; both scanned
+// values are resolved against the existing bindings in one transaction and
+// the verdict (CONSISTENT, MISMATCH, PARTIAL or UNREGISTERED) is stored as an
+// immutable inspection record. Illegal identifiers reject the whole request
+// with 422 and nothing is stored.
+func (h *Handler) CreateInspection(c *gin.Context) {
+	var req InspectionRequest
+	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "body must be a JSON object with chip_uid and board_serial string fields",
+		})
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "body must contain exactly one JSON object",
+		})
+		return
+	}
+	if verr := ValidateInspectionRequest(req); verr != nil {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "identifiers must be 1-64 characters of A-Z, 0-9 or '-'",
+			Details: verr.Fields,
+		})
+		return
+	}
+
+	insp, err := h.store.CreateInspection(c.Request.Context(), req)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, apiError{Code: CodeInternal, Message: "internal error"})
+		return
+	}
+	c.JSON(http.StatusCreated, insp)
+}
+
+// GetInspection handles GET /api/v1/inspections/:inspection_id. A repair
+// technician reviews the original, immutable verdict of a past scan. A path
+// segment that is not a positive integer is a 422 validation error (nothing
+// is queried); a legal id without a record is a 404.
+func (h *Handler) GetInspection(c *gin.Context) {
+	raw := c.Param("inspection_id")
+	// ParseInt keeps its range check, but it accepts a leading sign; a path id
+	// must be a canonical positive integer ("1", not "+1", "-1" or "01").
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || raw[0] < '1' || raw[0] > '9' {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "inspection_id must be a positive integer",
+			Details: map[string]string{"inspection_id": "must be a positive integer"},
+		})
+		return
+	}
+
+	insp, err := h.store.GetInspection(c.Request.Context(), id)
+	if errors.Is(err, ErrInspectionNotFound) {
+		writeError(c, http.StatusNotFound, apiError{Code: CodeNotFound, Message: "inspection not found"})
+		return
+	}
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, apiError{Code: CodeInternal, Message: "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, insp)
 }
 
 // unknownFieldName extracts the field name from a json "unknown field" error.
