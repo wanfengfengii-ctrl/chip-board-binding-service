@@ -23,6 +23,8 @@
 
 `0002_inspections.sql` 增加返修拆机前的实物核验账本 `inspections`：保存扫描值 `chip_uid` / `board_serial`、判定结果 `result`、两侧可空的绑定编号（外键到 `bindings.id`）和创建时间。该表**只写不改**——除应用层不提供更新/删除入口外，数据库触发器 `inspections_no_update` / `inspections_no_delete` 会直接拒绝任何 UPDATE 或 DELETE。
 
+`0003_mismatch_peers.sql` 为串件排查补充两个部分索引（仅覆盖 `result = 'MISMATCH'` 的行，分别以 `chip_binding_id` / `board_binding_id` 为前导列），让按绑定聚合不匹配核验只扫描触及目标绑定的记录。
+
 ## API
 
 三个标识（`request_key`、`chip_uid`、`board_serial`）均为 1–64 位 ASCII 大写字母、数字或连字符；任一字段非法 → 整次 `422`，不入库。
@@ -137,6 +139,39 @@
 - 路径段必须是正整数；`0`、负数、小数、带符号或非数字一律 `422 VALIDATION_FAILED`，不查询数据库。
 - 合法但不存在的编号返回 `404 NOT_FOUND`。
 - 记录写入后不提供更新或删除入口，数据库触发器同样拒绝任何 UPDATE / DELETE。
+
+## 串件排查
+
+返修主管发现某条绑定疑似串件时，不必逐条翻阅检查记录：下面的端点直接给出它在不匹配核验中牵连的其他绑定，按重复发生程度排序，便于安排排查。
+
+### `GET /api/v1/bindings/{binding_id}/mismatch-peers?limit=`
+
+```json
+{
+  "binding": { "binding_id": 1, "request_key": "REQ-001", "chip_uid": "CHIP-9", "board_serial": "BOARD-7", "created_at": "..." },
+  "peers": [
+    {
+      "binding": { "binding_id": 2, "request_key": "REQ-002", "chip_uid": "CHIP-2", "board_serial": "BOARD-1", "created_at": "..." },
+      "occurrences": 3,
+      "last_inspection_id": 42,
+      "last_occurred_at": "..."
+    }
+  ]
+}
+```
+
+- 返回目标绑定摘要 `binding` 与关联绑定列表 `peers`；每个关联项携带该侧绑定摘要、共同出现次数 `occurrences`、最近检查编号 `last_inspection_id` 和最近发生时间 `last_occurred_at`。
+- 聚合只依据不可修改核验记录上保存的两侧绑定编号（`result = 'MISMATCH'` 的记录），不按当前标识重新解析——后续绑定数据变化不会重算历史关系；`CONSISTENT` / `PARTIAL` / `UNREGISTERED` 核验不参与统计。
+- 排序固定为次数降序、最近检查编号降序、关联绑定编号升序，截取稳定；`limit` 可选，1–50，缺省 50。
+- 整个查询在**同一个只读 REPEATABLE READ 事务**中完成，全程不产生写入；`0003_mismatch_peers.sql` 为两侧绑定编号各建了一个仅匹配 `MISMATCH` 行的部分索引。
+- 没有不匹配记录时 `peers` 为空数组 `[]`（目标绑定存在时仍返回 `200`）。
+
+| 情形 | 响应 |
+|---|---|
+| `binding_id` 非正整数（`0`、负数、小数、带符号、非数字） | `422 VALIDATION_FAILED`，`details.binding_id`，不查询数据库 |
+| `limit` 越界或非整数（`0`、`51`、`abc` 等） | `422 VALIDATION_FAILED`，`details.limit`，不查询数据库 |
+| 目标绑定不存在 | `404 NOT_FOUND` |
+| 数据库故障 | `500 INTERNAL` |
 
 ## 运行（Docker Compose）
 

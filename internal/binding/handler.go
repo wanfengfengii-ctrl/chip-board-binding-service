@@ -336,6 +336,52 @@ func (h *Handler) GetInspection(c *gin.Context) {
 	c.JSON(http.StatusOK, insp)
 }
 
+// GetMismatchPeers handles GET /api/v1/bindings/:binding_id/mismatch-peers. A
+// repair supervisor reviewing a suspected mix-up sees every other binding the
+// target was implicated with in mismatch inspections, most repeated first, so
+// the worst relations can be investigated without paging through inspection
+// records one by one. A path id that is not a positive integer or a limit
+// outside 1-50 is a 422 (nothing is queried); a legal id without a binding is
+// a 404; a binding with no mismatch history yields an empty peers array.
+func (h *Handler) GetMismatchPeers(c *gin.Context) {
+	raw := c.Param("binding_id")
+	// Same canonical positive-integer rule as the inspection review path.
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || raw[0] < '1' || raw[0] > '9' {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "binding_id must be a positive integer",
+			Details: map[string]string{"binding_id": "must be a positive integer"},
+		})
+		return
+	}
+
+	limit := DefaultMismatchPeerLimit
+	if rawLimit, ok := c.GetQuery("limit"); ok {
+		n, perr := strconv.ParseInt(rawLimit, 10, 64)
+		if perr != nil || n < 1 || n > MaxMismatchPeerLimit || rawLimit[0] < '1' || rawLimit[0] > '9' {
+			writeError(c, http.StatusUnprocessableEntity, apiError{
+				Code:    CodeValidationFailed,
+				Message: "limit must be an integer between 1 and 50",
+				Details: map[string]string{"limit": "must be an integer between 1 and 50"},
+			})
+			return
+		}
+		limit = int(n)
+	}
+
+	res, err := h.store.GetMismatchPeers(c.Request.Context(), id, limit)
+	if errors.Is(err, ErrNotFound) {
+		writeError(c, http.StatusNotFound, apiError{Code: CodeNotFound, Message: "binding not found"})
+		return
+	}
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, apiError{Code: CodeInternal, Message: "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
 // unknownFieldName extracts the field name from a json "unknown field" error.
 func unknownFieldName(err error) (string, bool) {
 	msg := err.Error()

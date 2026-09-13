@@ -86,6 +86,33 @@ type BatchItem struct {
 	Binding *Binding     `json:"binding,omitempty"`
 }
 
+// Mismatch-peer lookup bounds: a repair supervisor reviews between one and
+// fifty implicated bindings at a time. DefaultMismatchPeerLimit applies when
+// the query carries no limit.
+const (
+	DefaultMismatchPeerLimit = 50
+	MaxMismatchPeerLimit     = 50
+)
+
+// MismatchPeer is one binding implicated with the target binding by mismatch
+// inspections: how often the pair was recorded together, the most recent
+// inspection id and when that most recent mismatch happened.
+type MismatchPeer struct {
+	Binding          Binding   `json:"binding"`
+	Occurrences      int64     `json:"occurrences"`
+	LastInspectionID int64     `json:"last_inspection_id"`
+	LastOccurredAt   time.Time `json:"last_occurred_at"`
+}
+
+// MismatchPeers is the response of the mismatch-peers lookup: the target
+// binding summary plus every binding it was mismatched against, ordered for
+// triage (most repeated first). Peers is empty — never null — when the target
+// has no mismatch history.
+type MismatchPeers struct {
+	Binding Binding        `json:"binding"`
+	Peers   []MismatchPeer `json:"peers"`
+}
+
 // InspectionRequest is the payload of POST /api/v1/inspections. Before
 // teardown a repair technician scans a chip and the board it is soldered to in
 // one physical verification; ChipUID and BoardSerial carry the two scanned

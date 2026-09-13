@@ -103,6 +103,27 @@ type inspectionResponse struct {
 	raw        []byte
 }
 
+// mismatchPeer mirrors one implicated binding of the mismatch-peers response.
+type mismatchPeer struct {
+	Binding          binding `json:"binding"`
+	Occurrences      int64   `json:"occurrences"`
+	LastInspectionID int64   `json:"last_inspection_id"`
+	LastOccurredAt   string  `json:"last_occurred_at"`
+}
+
+// mismatchPeersBody mirrors the wire shape of the mismatch-peers response.
+type mismatchPeersBody struct {
+	Binding binding        `json:"binding"`
+	Peers   []mismatchPeer `json:"peers"`
+}
+
+type mismatchPeersResponse struct {
+	status  int
+	body    mismatchPeersBody
+	errBody errorEnvelope
+	raw     []byte
+}
+
 type verifier struct {
 	base     string
 	client   *http.Client
@@ -138,6 +159,7 @@ func main() {
 	v.scenarioBatchValidationRejected()
 	v.scenarioInspectionVerdicts()
 	v.scenarioInspectionReviewAndErrors()
+	v.scenarioMismatchPeers()
 
 	fmt.Println()
 	if v.failures > 0 {
@@ -718,6 +740,103 @@ func (v *verifier) scenarioInspectionReviewAndErrors() {
 		"inspections do not modify existing bindings")
 }
 
+// scenarioMismatchPeers drives the repair supervisor's triage view: a binding
+// suspected of a mix-up reveals every other binding it was implicated with in
+// mismatch inspections, most repeated first, with the co-occurrence count,
+// the most recent inspection id and its timestamp. Both sides of one relation
+// must agree on the count, ties must order deterministically, the limit must
+// clip the list, and consistent or partial verifications must not feed the
+// statistics.
+func (v *verifier) scenarioMismatchPeers() {
+	fmt.Println("scenario: mismatch peers triage view")
+
+	mk := func(tag string) response {
+		r := v.create("REQ-"+v.run+"-MP-"+tag, "CHIP-"+v.run+"-MP-"+tag, "BOARD-"+v.run+"-MP-"+tag)
+		v.check(r.status == http.StatusCreated, "setup binding %s returns 201 (got %d: %s)", tag, r.status, r.raw)
+		return r
+	}
+	a := mk("A")
+	b := mk("B")
+	c := mk("C")
+	d := mk("D")
+
+	// A-B mismatch twice (both scan directions), A-C and A-D once each.
+	v.inspect("CHIP-"+v.run+"-MP-A", "BOARD-"+v.run+"-MP-B")
+	mAB2 := v.inspect("CHIP-"+v.run+"-MP-B", "BOARD-"+v.run+"-MP-A")
+	mAC := v.inspect("CHIP-"+v.run+"-MP-A", "BOARD-"+v.run+"-MP-C")
+	mAD := v.inspect("CHIP-"+v.run+"-MP-A", "BOARD-"+v.run+"-MP-D")
+	v.check(mAB2.inspection.Result == "MISMATCH" && mAC.inspection.Result == "MISMATCH" && mAD.inspection.Result == "MISMATCH",
+		"setup cross scans are MISMATCH")
+
+	// Consistent and partial verifications must not feed the statistics.
+	v.inspect("CHIP-"+v.run+"-MP-A", "BOARD-"+v.run+"-MP-A")
+	v.inspect("CHIP-"+v.run+"-MP-A", "BOARD-"+v.run+"-MP-GHOST")
+
+	res := v.mismatchPeers(a.binding.BindingID, "")
+	v.check(res.status == http.StatusOK, "mismatch-peers returns 200 (got %d: %s)", res.status, res.raw)
+	v.check(res.body.Binding == a.binding, "response carries the target binding summary")
+	ok := len(res.body.Peers) == 3
+	v.check(ok, "three implicated peers returned, consistent/partial scans excluded (got %d)", len(res.body.Peers))
+	if ok {
+		v.check(res.body.Peers[0].Binding == b.binding && res.body.Peers[0].Occurrences == 2,
+			"most repeated peer first: B with 2 occurrences (got binding %d, %d)",
+			res.body.Peers[0].Binding.BindingID, res.body.Peers[0].Occurrences)
+		v.check(res.body.Peers[0].LastInspectionID == mAB2.inspection.InspectionID &&
+			res.body.Peers[0].LastOccurredAt == mAB2.inspection.CreatedAt,
+			"peer B pins the most recent of its two inspections")
+		// A-C and A-D tie at one occurrence: most recent inspection first.
+		v.check(res.body.Peers[1].Binding == d.binding && res.body.Peers[2].Binding == c.binding,
+			"equal-count peers order by most recent inspection first")
+		v.check(res.body.Peers[1].LastInspectionID == mAD.inspection.InspectionID &&
+			res.body.Peers[2].LastInspectionID == mAC.inspection.InspectionID,
+			"tied peers pin their own latest inspections")
+	}
+
+	// Both sides of the same relation agree on count and latest inspection.
+	rev := v.mismatchPeers(b.binding.BindingID, "")
+	v.check(rev.status == http.StatusOK && len(rev.body.Peers) == 1 &&
+		rev.body.Peers[0].Binding == a.binding && rev.body.Peers[0].Occurrences == 2 &&
+		rev.body.Peers[0].LastInspectionID == mAB2.inspection.InspectionID,
+		"viewed from B the same relation shows identical count and latest inspection (got %d: %s)", rev.status, rev.raw)
+
+	// The limit clips the deterministic ordering.
+	lim := v.mismatchPeers(a.binding.BindingID, "?limit=1")
+	v.check(lim.status == http.StatusOK && len(lim.body.Peers) == 1 && lim.body.Peers[0].Binding == b.binding,
+		"limit=1 keeps only the most repeated peer (got %d: %s)", lim.status, lim.raw)
+	lim2 := v.mismatchPeers(a.binding.BindingID, "?limit=2")
+	v.check(lim2.status == http.StatusOK && len(lim2.body.Peers) == 2,
+		"limit=2 keeps the two most relevant peers (got %d)", len(lim2.body.Peers))
+
+	// A binding with no mismatch history returns an empty array.
+	e := mk("E")
+	empty := v.mismatchPeers(e.binding.BindingID, "")
+	v.check(empty.status == http.StatusOK && len(empty.body.Peers) == 0 && strings.Contains(string(empty.raw), `"peers":[]`),
+		"binding without mismatches returns an empty peers array (got %d: %s)", empty.status, empty.raw)
+
+	// Illegal ids and limits are 422 before any query; unknown ids are 404.
+	for _, bad := range []string{"0", "-1", "abc", "01"} {
+		r := v.mismatchPeersRaw("/api/v1/bindings/" + bad + "/mismatch-peers")
+		v.check(r.status == http.StatusUnprocessableEntity && r.errBody.Error.Code == codeValidationFailed,
+			"binding id %q rejected with 422 VALIDATION_FAILED (got %d: %s)", bad, r.status, r.raw)
+	}
+	for _, bad := range []string{"0", "51", "abc"} {
+		r := v.mismatchPeers(a.binding.BindingID, "?limit="+bad)
+		v.check(r.status == http.StatusUnprocessableEntity && r.errBody.Error.Code == codeValidationFailed,
+			"limit %q rejected with 422 VALIDATION_FAILED (got %d: %s)", bad, r.status, r.raw)
+	}
+	missing := v.mismatchPeers(999999999, "")
+	v.check(missing.status == http.StatusNotFound && missing.errBody.Error.Code == codeNotFound,
+		"unknown binding id returns 404 NOT_FOUND (got %d: %s)", missing.status, missing.raw)
+
+	// The existing endpoints are untouched by the new route.
+	byChip := v.get("/api/v1/bindings/by-chip-uid/CHIP-" + v.run + "-MP-A")
+	v.check(byChip.status == http.StatusOK && byChip.binding == a.binding,
+		"binding lookup unchanged alongside mismatch-peers")
+	review := v.getInspection(mAB2.inspection.InspectionID)
+	v.check(review.status == http.StatusOK && inspectionsEqual(review.inspection, mAB2.inspection),
+		"inspection review unchanged alongside mismatch-peers")
+}
+
 // inspectionsEqual compares two inspection records deeply: the embedded
 // binding summaries are pointers, so a plain == would compare addresses even
 // when the payloads are byte-identical.
@@ -869,6 +988,34 @@ func (v *verifier) getInspection(id int64) inspectionResponse {
 	out := inspectionResponse{status: resp.StatusCode, raw: raw}
 	if resp.StatusCode == http.StatusOK {
 		_ = json.Unmarshal(raw, &out.inspection)
+	} else {
+		_ = json.Unmarshal(raw, &out.errBody)
+	}
+	return out
+}
+
+// mismatchPeers queries the mismatch-peers endpoint for one binding id; the
+// limitQuery carries an optional raw query string such as "?limit=5".
+func (v *verifier) mismatchPeers(id int64, limitQuery string) mismatchPeersResponse {
+	return v.mismatchPeersRaw(fmt.Sprintf("/api/v1/bindings/%d/mismatch-peers%s", id, limitQuery))
+}
+
+// mismatchPeersRaw fetches a mismatch-peers path verbatim, so illegal ids and
+// limits can be probed too.
+func (v *verifier) mismatchPeersRaw(path string) mismatchPeersResponse {
+	req, err := http.NewRequest(http.MethodGet, v.base+path, nil)
+	if err != nil {
+		return mismatchPeersResponse{status: -1, raw: []byte(err.Error())}
+	}
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return mismatchPeersResponse{status: -1, raw: []byte(err.Error())}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := mismatchPeersResponse{status: resp.StatusCode, raw: raw}
+	if resp.StatusCode == http.StatusOK {
+		_ = json.Unmarshal(raw, &out.body)
 	} else {
 		_ = json.Unmarshal(raw, &out.errBody)
 	}

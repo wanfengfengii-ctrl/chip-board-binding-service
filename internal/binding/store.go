@@ -449,6 +449,86 @@ func scanInspection(row pgx.Row) (Inspection, error) {
 	return in, nil
 }
 
+// mismatchPeersSQL aggregates the immutable mismatch inspections that
+// implicated the target binding on either side. The binding ids stored on the
+// inspection rows are used exactly as recorded at decision time — later
+// binding activity never rewrites them — so the historical relations are
+// stable. Peers are ordered for triage: most repeated first, then most recent
+// inspection, then lowest peer binding id, so the LIMIT cut is deterministic.
+// The outer SELECT repeats the ordering because SQL does not preserve the
+// subquery order across the joins.
+const mismatchPeersSQL = `
+SELECT
+    b.id, r.request_key, r.chip_uid, r.board_serial, r.created_at,
+    stats.occurrences, stats.last_inspection_id, stats.last_occurred_at
+FROM (
+    SELECT
+        CASE WHEN i.chip_binding_id = $1 THEN i.board_binding_id ELSE i.chip_binding_id END AS peer_id,
+        COUNT(*)          AS occurrences,
+        MAX(i.id)         AS last_inspection_id,
+        MAX(i.created_at) AS last_occurred_at
+    FROM inspections i
+    WHERE i.result = 'MISMATCH'
+      AND (i.chip_binding_id = $1 OR i.board_binding_id = $1)
+    GROUP BY 1
+    ORDER BY occurrences DESC, last_inspection_id DESC, peer_id ASC
+    LIMIT $2
+) stats
+JOIN bindings b ON b.id = stats.peer_id
+JOIN requests r ON r.request_key = b.request_key
+ORDER BY stats.occurrences DESC, stats.last_inspection_id DESC, stats.peer_id ASC`
+
+// GetMismatchPeers returns the target binding together with the bindings it
+// was implicated with in recorded mismatch inspections, most repeated first.
+// Only the binding ids stored on the immutable inspection rows feed the
+// aggregation, so later binding activity never recomputes history. The whole
+// lookup runs in one read-only repeatable-read transaction: it writes nothing
+// and never mixes snapshots. ErrNotFound is returned when the target binding
+// does not exist.
+func (s *Store) GetMismatchPeers(ctx context.Context, bindingID int64, limit int) (MismatchPeers, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return MismatchPeers{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	target, err := scanBinding(tx.QueryRow(ctx, selectBindingSQL+`WHERE b.id = $1`, bindingID))
+	if err != nil {
+		return MismatchPeers{}, err
+	}
+
+	rows, err := tx.Query(ctx, mismatchPeersSQL, bindingID, limit)
+	if err != nil {
+		return MismatchPeers{}, err
+	}
+	peers := make([]MismatchPeer, 0)
+	for rows.Next() {
+		var p MismatchPeer
+		if err := rows.Scan(
+			&p.Binding.BindingID, &p.Binding.RequestKey, &p.Binding.ChipUID, &p.Binding.BoardSerial, &p.Binding.CreatedAt,
+			&p.Occurrences, &p.LastInspectionID, &p.LastOccurredAt,
+		); err != nil {
+			rows.Close()
+			return MismatchPeers{}, err
+		}
+		p.Binding.CreatedAt = p.Binding.CreatedAt.UTC()
+		p.LastOccurredAt = p.LastOccurredAt.UTC()
+		peers = append(peers, p)
+	}
+	if err := rows.Err(); err != nil {
+		return MismatchPeers{}, err
+	}
+	rows.Close()
+
+	if err := tx.Commit(ctx); err != nil {
+		return MismatchPeers{}, err
+	}
+	return MismatchPeers{Binding: target, Peers: peers}, nil
+}
+
 // Ping reports whether the database is reachable.
 func (s *Store) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)

@@ -36,8 +36,9 @@ type bindingJSON struct {
 
 type errorJSON struct {
 	Error struct {
-		Code  string `json:"code"`
-		Field string `json:"field"`
+		Code    string            `json:"code"`
+		Field   string            `json:"field"`
+		Details map[string]string `json:"details"`
 	} `json:"error"`
 }
 
