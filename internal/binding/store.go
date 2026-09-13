@@ -401,10 +401,15 @@ func (s *Store) GetInspection(ctx context.Context, inspectionID int64) (Inspecti
 	return scanInspection(s.pool.QueryRow(ctx, selectInspectionSQL, inspectionID))
 }
 
-// scanInspection scans the 17 columns of selectInspectionSQL. The stored
-// binding id columns and all summary columns are nullable; a nil summary
-// means that side was unregistered.
-func scanInspection(row pgx.Row) (Inspection, error) {
+// rowScanner is satisfied by both pgx.Row and pgx.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanInspectionColumns scans the 17 columns of selectInspectionSQL. The
+// stored binding id columns and all summary columns are nullable; a nil
+// summary means that side was unregistered.
+func scanInspectionColumns(s rowScanner) (Inspection, error) {
 	var in Inspection
 	var result string
 	var chipID, boardID *int64
@@ -412,15 +417,12 @@ func scanInspection(row pgx.Row) (Inspection, error) {
 	var chipCreatedAt *time.Time
 	var boardKey, boardChip, boardSerial *string
 	var boardCreatedAt *time.Time
-	err := row.Scan(
+	err := s.Scan(
 		&in.InspectionID, &in.ChipUID, &in.BoardSerial, &result,
 		&chipID, &boardID, &in.CreatedAt,
 		&chipID, &chipKey, &chipUID, &chipBoard, &chipCreatedAt,
 		&boardID, &boardKey, &boardChip, &boardSerial, &boardCreatedAt,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Inspection{}, ErrInspectionNotFound
-	}
 	if err != nil {
 		return Inspection{}, err
 	}
@@ -445,6 +447,19 @@ func scanInspection(row pgx.Row) (Inspection, error) {
 			BoardSerial: *boardSerial,
 			CreatedAt:   boardCreatedAt.UTC(),
 		}
+	}
+	return in, nil
+}
+
+// scanInspection scans one selectInspectionSQL row, mapping no-row to
+// ErrInspectionNotFound.
+func scanInspection(row pgx.Row) (Inspection, error) {
+	in, err := scanInspectionColumns(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Inspection{}, ErrInspectionNotFound
+	}
+	if err != nil {
+		return Inspection{}, err
 	}
 	return in, nil
 }
@@ -527,6 +542,125 @@ func (s *Store) GetMismatchPeers(ctx context.Context, bindingID int64, limit int
 		return MismatchPeers{}, err
 	}
 	return MismatchPeers{Binding: target, Peers: peers}, nil
+}
+
+// bindingInspectionsSQL selects the full records of every inspection that
+// stored the target binding id on either side. Instead of an OR across the two
+// binding columns (which forces a backward scan of the whole primary key),
+// each side is its own bounded branch driven by its (binding id, id) index:
+// the global top (limit+1) rows can never include a row that is not already
+// in its branch's top (limit+1), so bounding every branch stays exact while
+// touching at most 2*(limit+1) inspection rows. UNION ALL keeps a record that
+// stored the target on both sides twice and DISTINCT ON collapses it back to
+// one. Paging is a stable keyset on the immutable inspection id: beforeID pins
+// an exclusive upper bound, so inspections committed while a client walks the
+// pages can neither duplicate nor evict rows of pages already keyed below it.
+const bindingInspectionsSQL = `
+SELECT DISTINCT ON (u.id)
+    u.id, u.chip_uid, u.board_serial, u.result,
+    u.chip_binding_id, u.board_binding_id, u.created_at,
+    cb.id, cr.request_key, cr.chip_uid, cr.board_serial, cr.created_at,
+    bb.id, br.request_key, br.chip_uid, br.board_serial, br.created_at
+FROM (
+    (SELECT i.id, i.chip_uid, i.board_serial, i.result, i.chip_binding_id, i.board_binding_id, i.created_at
+     FROM inspections i
+     WHERE i.chip_binding_id = $1 AND ($2::bigint IS NULL OR i.id < $2)
+     ORDER BY i.id DESC
+     LIMIT $3)
+    UNION ALL
+    (SELECT i.id, i.chip_uid, i.board_serial, i.result, i.chip_binding_id, i.board_binding_id, i.created_at
+     FROM inspections i
+     WHERE i.board_binding_id = $1 AND ($2::bigint IS NULL OR i.id < $2)
+     ORDER BY i.id DESC
+     LIMIT $3)
+) u
+LEFT JOIN bindings cb ON cb.id = u.chip_binding_id
+LEFT JOIN requests cr ON cr.request_key = cb.request_key
+LEFT JOIN bindings bb ON bb.id = u.board_binding_id
+LEFT JOIN requests br ON br.request_key = bb.request_key
+ORDER BY u.id DESC
+LIMIT $3`
+
+// GetBindingInspections returns one page of the physical verifications that
+// ever hit the target binding, newest inspection first, along with the side
+// (chip / board / both) each record hit it on. It follows exactly the binding
+// ids stored on the immutable inspection rows — current bindings are not
+// re-resolved — and runs in one read-only repeatable-read transaction, so it
+// writes nothing and reads one snapshot. A nil beforeID starts at the newest
+// record; otherwise the page contains only records strictly older than
+// beforeID. The returned cursor is the id to pass as beforeID next, or nil on
+// the last page. ErrNotFound is returned when the target binding does not
+// exist.
+func (s *Store) GetBindingInspections(ctx context.Context, bindingID int64, beforeID *int64, limit int) (InspectionHistory, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return InspectionHistory{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	target, err := scanBinding(tx.QueryRow(ctx, selectBindingSQL+`WHERE b.id = $1`, bindingID))
+	if err != nil {
+		return InspectionHistory{}, err
+	}
+
+	rows, err := tx.Query(ctx, bindingInspectionsSQL, bindingID, beforeID, limit+1)
+	if err != nil {
+		return InspectionHistory{}, err
+	}
+	entries := make([]InspectionHit, 0, limit)
+	hasMore := false
+	count := 0
+	for rows.Next() {
+		in, scanErr := scanInspectionColumns(rows)
+		if scanErr != nil {
+			rows.Close()
+			return InspectionHistory{}, scanErr
+		}
+		count++
+		if count > limit {
+			// The (limit+1)th row only proves another page exists; it stays
+			// out of this page and becomes the head of the next one.
+			hasMore = true
+			break
+		}
+		entries = append(entries, InspectionHit{Inspection: in, HitSide: hitSide(in, bindingID)})
+	}
+	if err := rows.Err(); err != nil {
+		return InspectionHistory{}, err
+	}
+	rows.Close()
+
+	// Keyset cursor: the oldest returned id. The next page asks for ids
+	// strictly below it, so the cut is stable even if newer inspections commit
+	// meanwhile — a freshly inserted high id can never enter a window that
+	// starts below a fixed id.
+	var cursor *int64
+	if hasMore && len(entries) > 0 {
+		id := entries[len(entries)-1].Inspection.InspectionID
+		cursor = &id
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return InspectionHistory{}, err
+	}
+	return InspectionHistory{Binding: target, Entries: entries, NextCursor: cursor}, nil
+}
+
+// hitSide reports on which side(s) the record stored the target binding id.
+func hitSide(in Inspection, bindingID int64) HitSide {
+	chipHit := in.ChipBindingID != nil && *in.ChipBindingID == bindingID
+	boardHit := in.BoardBindingID != nil && *in.BoardBindingID == bindingID
+	switch {
+	case chipHit && boardHit:
+		return HitSideBoth
+	case chipHit:
+		return HitSideChip
+	default:
+		return HitSideBoard
+	}
 }
 
 // Ping reports whether the database is reachable.

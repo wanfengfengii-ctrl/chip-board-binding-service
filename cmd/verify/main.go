@@ -125,6 +125,27 @@ type mismatchPeersResponse struct {
 	raw     []byte
 }
 
+// inspectionHit mirrors one entry of a binding's inspection history: the full
+// immutable inspection record plus the side on which the binding was hit.
+type inspectionHit struct {
+	Inspection inspection `json:"inspection"`
+	HitSide    string     `json:"hit_side"`
+}
+
+// inspectionHistoryBody mirrors the wire shape of one history page.
+type inspectionHistoryBody struct {
+	Binding    binding         `json:"binding"`
+	Entries    []inspectionHit `json:"entries"`
+	NextCursor *int64          `json:"next_cursor"`
+}
+
+type inspectionHistoryResponse struct {
+	status  int
+	body    inspectionHistoryBody
+	errBody errorEnvelope
+	raw     []byte
+}
+
 type verifier struct {
 	base     string
 	client   *http.Client
@@ -161,6 +182,7 @@ func main() {
 	v.scenarioInspectionVerdicts()
 	v.scenarioInspectionReviewAndErrors()
 	v.scenarioMismatchPeers()
+	v.scenarioBindingInspectionHistory()
 	v.scenarioDuplicateFieldsRejected()
 
 	fmt.Println()
@@ -839,6 +861,235 @@ func (v *verifier) scenarioMismatchPeers() {
 		"inspection review unchanged alongside mismatch-peers")
 }
 
+// scenarioBindingInspectionHistory drives the repair supervisor's review of
+// one binding: the endpoint must replay the physical scans that ever hit it —
+// on the chip side, the board side or both — with each full record and hit
+// side, newest inspection first, paged by a stable inspection-id keyset. Pages
+// must not repeat or skip rows; a cursor held while new verifications commit
+// must keep reading the older pages unchanged; illegal binding ids, cursors
+// and limits are 422 before any query, an unknown binding is 404, and a cursor
+// below every record returns an empty array without writing anything.
+func (v *verifier) scenarioBindingInspectionHistory() {
+	fmt.Println("scenario: binding inspection history (chip/board/both sides, keyset paging)")
+
+	mk := func(tag string) response {
+		r := v.create("REQ-"+v.run+"-IH-"+tag, "CHIP-"+v.run+"-IH-"+tag, "BOARD-"+v.run+"-IH-"+tag)
+		v.check(r.status == http.StatusCreated, "setup binding %s returns 201 (got %d: %s)", tag, r.status, r.raw)
+		return r
+	}
+	a := mk("A")
+	b := mk("B")
+
+	// Five verifications touch binding A; two scans between other bindings and
+	// unregistered scans must never appear in A's history.
+	both1 := v.inspect("CHIP-"+v.run+"-IH-A", "BOARD-"+v.run+"-IH-A")
+	v.check(both1.status == http.StatusCreated && both1.inspection.Result == "CONSISTENT",
+		"both-side scan of A is CONSISTENT (got %d/%q)", both1.status, both1.inspection.Result)
+	chip1 := v.inspect("CHIP-"+v.run+"-IH-A", "BOARD-"+v.run+"-IH-B")
+	v.check(chip1.inspection.Result == "MISMATCH", "chip-side scan of A is MISMATCH (got %q)", chip1.inspection.Result)
+	board1 := v.inspect("CHIP-"+v.run+"-IH-B", "BOARD-"+v.run+"-IH-A")
+	v.check(board1.inspection.Result == "MISMATCH", "board-side scan of A is MISMATCH (got %q)", board1.inspection.Result)
+	chip2 := v.inspect("CHIP-"+v.run+"-IH-A", "BOARD-"+v.run+"-IH-GHOST")
+	v.check(chip2.inspection.Result == "PARTIAL", "chip-side partial scan of A (got %q)", chip2.inspection.Result)
+	board2 := v.inspect("CHIP-"+v.run+"-IH-GHOST", "BOARD-"+v.run+"-IH-A")
+	v.check(board2.inspection.Result == "PARTIAL", "board-side partial scan of A (got %q)", board2.inspection.Result)
+	v.inspect("CHIP-"+v.run+"-IH-B", "BOARD-"+v.run+"-IH-B")
+	v.inspect("CHIP-"+v.run+"-IH-NEVER", "BOARD-"+v.run+"-IH-NEVER2")
+
+	want := []struct {
+		id   int64
+		side string
+	}{
+		{board2.inspection.InspectionID, "board"},
+		{chip2.inspection.InspectionID, "chip"},
+		{board1.inspection.InspectionID, "board"},
+		{chip1.inspection.InspectionID, "chip"},
+		{both1.inspection.InspectionID, "both"},
+	}
+
+	head := v.bindingInspections(a.binding.BindingID, "")
+	v.check(head.status == http.StatusOK, "history returns 200 (got %d: %s)", head.status, head.raw)
+	v.check(head.body.Binding == a.binding, "history carries the target binding summary")
+	v.check(len(head.body.Entries) == 5, "exactly the five verifications that touched A, each once (got %d)", len(head.body.Entries))
+	v.check(head.body.NextCursor == nil, "everything fits one page, cursor is null")
+	for i, w := range want {
+		if i >= len(head.body.Entries) {
+			break
+		}
+		e := head.body.Entries[i]
+		v.check(e.Inspection.InspectionID == w.id && e.HitSide == w.side,
+			"entry %d is inspection %d hit on %q (got %d/%q)", i, w.id, w.side, e.Inspection.InspectionID, e.HitSide)
+		// The full record travels with the entry and matches the review endpoint.
+		review := v.getInspection(w.id)
+		v.check(review.status == http.StatusOK && inspectionsEqual(review.inspection, e.Inspection),
+			"entry %d carries the complete inspection record %d", i, w.id)
+		if i > 0 {
+			prev := head.body.Entries[i-1].Inspection.InspectionID
+			v.check(prev > e.Inspection.InspectionID, "entry %d keeps strict descending inspection order", i)
+		}
+	}
+
+	// Page through the same history with limit=2: no id may repeat or skip and
+	// the order must match the one-shot head response.
+	var paged []int64
+	var cursor *int64
+	pages := 0
+	for {
+		page := v.bindingInspections(a.binding.BindingID, historyQuery(cursor, 2))
+		v.check(page.status == http.StatusOK, "paged history returns 200 (got %d: %s)", page.status, page.raw)
+		v.check(len(page.body.Entries) > 0 && len(page.body.Entries) <= 2, "page carries 1-2 entries (got %d)", len(page.body.Entries))
+		for _, e := range page.body.Entries {
+			paged = append(paged, e.Inspection.InspectionID)
+		}
+		pages++
+		cursor = page.body.NextCursor
+		if cursor == nil {
+			break
+		}
+		v.check(pages <= 3, "paging terminates")
+	}
+	wantIDs := make([]int64, len(want))
+	for i, w := range want {
+		wantIDs[i] = w.id
+	}
+	v.check(pages == 3 && intsEqual(paged, wantIDs),
+		"three pages reconstruct the fixed descending history exactly once (got %v)", paged)
+
+	// Repeating a cursor returns the same page: cursors are stable, not consumed.
+	again1 := v.bindingInspections(a.binding.BindingID, fmt.Sprintf("?limit=2&before_id=%d", wantIDs[0]))
+	again2 := v.bindingInspections(a.binding.BindingID, fmt.Sprintf("?limit=2&before_id=%d", wantIDs[0]))
+	v.check(again1.status == http.StatusOK && again2.status == http.StatusOK && historyEqual(again1.body, again2.body),
+		"the same cursor reads the same page twice (before_id=%d)", wantIDs[0])
+
+	// Hold a cursor, then let new verifications commit. The stale cursor must
+	// keep paging the older history without ever showing the newer rows.
+	stale := v.bindingInspections(a.binding.BindingID, "?limit=2")
+	v.check(stale.status == http.StatusOK && stale.body.NextCursor != nil, "first page yields a cursor")
+	staleCursor := *stale.body.NextCursor
+	newer := v.inspect("CHIP-"+v.run+"-IH-B", "BOARD-"+v.run+"-IH-A") // board-side hit, higher id
+	v.check(newer.status == http.StatusCreated && newer.inspection.InspectionID > staleCursor,
+		"the concurrently committed inspection has a newer id than the held cursor")
+	v.inspect("CHIP-"+v.run+"-IH-B", "BOARD-"+v.run+"-IH-B")
+	v.inspect("CHIP-"+v.run+"-IH-X", "BOARD-"+v.run+"-IH-Y")
+	var walked []int64
+	cur := staleCursor
+	for cur != 0 {
+		page := v.bindingInspections(a.binding.BindingID, fmt.Sprintf("?limit=2&before_id=%d", cur))
+		v.check(page.status == http.StatusOK, "stale-cursor page returns 200 (got %d: %s)", page.status, page.raw)
+		for _, e := range page.body.Entries {
+			walked = append(walked, e.Inspection.InspectionID)
+			v.check(e.Inspection.InspectionID != newer.inspection.InspectionID,
+				"inspection %d committed after paging started never enters an old page", newer.inspection.InspectionID)
+		}
+		if page.body.NextCursor == nil {
+			break
+		}
+		cur = *page.body.NextCursor
+	}
+	v.check(intsEqual(walked, wantIDs[2:]),
+		"stale cursor continues through the original older pages unchanged (got %v)", walked)
+
+	// A fresh walk from the head now starts with the newer hit, exactly once.
+	var fresh []int64
+	cursor = nil
+	for {
+		page := v.bindingInspections(a.binding.BindingID, historyQuery(cursor, 50))
+		v.check(page.status == http.StatusOK, "fresh walk returns 200 (got %d: %s)", page.status, page.raw)
+		for _, e := range page.body.Entries {
+			fresh = append(fresh, e.Inspection.InspectionID)
+		}
+		if page.body.NextCursor == nil {
+			break
+		}
+		cursor = page.body.NextCursor
+	}
+	v.check(len(fresh) == 6 && fresh[0] == newer.inspection.InspectionID && intsEqual(fresh[1:], wantIDs),
+		"fresh walk shows the new hit first followed by the original history (got %v)", fresh)
+
+	// A cursor below every record returns an empty array, not an error.
+	empty := v.bindingInspections(a.binding.BindingID, "?before_id=1")
+	v.check(empty.status == http.StatusOK && len(empty.body.Entries) == 0 && empty.body.NextCursor == nil &&
+		strings.Contains(string(empty.raw), `"entries":[]`),
+		"cursor before the first inspection returns an empty array (got %d: %s)", empty.status, empty.raw)
+
+	// Illegal parameters are 422 naming the offending field, before any query.
+	for _, bad := range []string{"0", "-1", "abc", "1.5", "+1", "01"} {
+		r := v.bindingInspectionsRaw("/api/v1/bindings/" + bad + "/inspections")
+		v.check(r.status == http.StatusUnprocessableEntity && r.errBody.Error.Code == codeValidationFailed &&
+			r.errBody.Error.Details["binding_id"] != "",
+			"binding id %q rejected with 422 on binding_id (got %d: %s)", bad, r.status, r.raw)
+	}
+	for _, bad := range []string{"0", "-1", "abc", "1.5", "+1", "01"} {
+		r := v.bindingInspections(a.binding.BindingID, "?before_id="+bad)
+		v.check(r.status == http.StatusUnprocessableEntity && r.errBody.Error.Code == codeValidationFailed &&
+			r.errBody.Error.Details["before_id"] != "",
+			"before_id %q rejected with 422 on before_id (got %d: %s)", bad, r.status, r.raw)
+	}
+	for _, bad := range []string{"0", "51", "100", "abc", "-3", "05"} {
+		r := v.bindingInspections(a.binding.BindingID, "?limit="+bad)
+		v.check(r.status == http.StatusUnprocessableEntity && r.errBody.Error.Code == codeValidationFailed &&
+			r.errBody.Error.Details["limit"] != "",
+			"limit %q rejected with 422 on limit (got %d: %s)", bad, r.status, r.raw)
+	}
+	missing := v.bindingInspections(999999999, "")
+	v.check(missing.status == http.StatusNotFound && missing.errBody.Error.Code == codeNotFound,
+		"unknown binding id returns 404 NOT_FOUND (got %d: %s)", missing.status, missing.raw)
+
+	// The history endpoint is read-only and leaves every existing contract in
+	// place: binding lookup, inspection review, batch lookup, mismatch peers.
+	byChip := v.get("/api/v1/bindings/by-chip-uid/CHIP-" + v.run + "-IH-A")
+	v.check(byChip.status == http.StatusOK && byChip.binding == a.binding, "binding lookup stays compatible")
+	review := v.getInspection(chip1.inspection.InspectionID)
+	v.check(review.status == http.StatusOK && inspectionsEqual(review.inspection, chip1.inspection), "inspection review stays compatible")
+	batch := v.batch([]batchQuery{{Line: 1, Type: "board_serial", Value: "BOARD-" + v.run + "-IH-A"}})
+	v.check(batch.status == http.StatusOK && len(batch.results) == 1 && batch.results[0].Status == "FOUND" &&
+		batch.results[0].Binding != nil && *batch.results[0].Binding == a.binding, "batch lookup stays compatible")
+	peers := v.mismatchPeers(a.binding.BindingID, "")
+	v.check(peers.status == http.StatusOK && len(peers.body.Peers) == 1 && peers.body.Peers[0].Binding == b.binding,
+		"mismatch peers stay compatible (only MISMATCH scans aggregated)")
+}
+
+// historyQuery builds the optional query string for one history page.
+func historyQuery(cursor *int64, limit int) string {
+	if cursor == nil {
+		return fmt.Sprintf("?limit=%d", limit)
+	}
+	return fmt.Sprintf("?limit=%d&before_id=%d", limit, *cursor)
+}
+
+// intsEqual reports whether two int64 slices are identical.
+func intsEqual(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// historyEqual compares two history pages on their ids, hit sides and cursor.
+func historyEqual(a, b inspectionHistoryBody) bool {
+	if a.NextCursor == nil && b.NextCursor != nil || a.NextCursor != nil && b.NextCursor == nil {
+		return false
+	}
+	if a.NextCursor != nil && *a.NextCursor != *b.NextCursor {
+		return false
+	}
+	if len(a.Entries) != len(b.Entries) {
+		return false
+	}
+	for i := range a.Entries {
+		if a.Entries[i].Inspection.InspectionID != b.Entries[i].Inspection.InspectionID ||
+			a.Entries[i].HitSide != b.Entries[i].HitSide {
+			return false
+		}
+	}
+	return true
+}
+
 // scenarioDuplicateFieldsRejected covers the ambiguous-payload rule shared by
 // every write/parse entry point: a JSON object that names the same member
 // twice leaves its meaning to "last value wins", so the service must reject
@@ -1108,6 +1359,34 @@ func (v *verifier) mismatchPeersRaw(path string) mismatchPeersResponse {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	out := mismatchPeersResponse{status: resp.StatusCode, raw: raw}
+	if resp.StatusCode == http.StatusOK {
+		_ = json.Unmarshal(raw, &out.body)
+	} else {
+		_ = json.Unmarshal(raw, &out.errBody)
+	}
+	return out
+}
+
+// bindingInspections queries one binding's inspection-history page; query
+// carries an optional raw query string such as "?limit=2&before_id=9".
+func (v *verifier) bindingInspections(id int64, query string) inspectionHistoryResponse {
+	return v.bindingInspectionsRaw(fmt.Sprintf("/api/v1/bindings/%d/inspections%s", id, query))
+}
+
+// bindingInspectionsRaw fetches a binding-inspections path verbatim, so illegal
+// ids and query parameters can be probed too.
+func (v *verifier) bindingInspectionsRaw(path string) inspectionHistoryResponse {
+	req, err := http.NewRequest(http.MethodGet, v.base+path, nil)
+	if err != nil {
+		return inspectionHistoryResponse{status: -1, raw: []byte(err.Error())}
+	}
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return inspectionHistoryResponse{status: -1, raw: []byte(err.Error())}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	out := inspectionHistoryResponse{status: resp.StatusCode, raw: raw}
 	if resp.StatusCode == http.StatusOK {
 		_ = json.Unmarshal(raw, &out.body)
 	} else {

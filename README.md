@@ -25,6 +25,8 @@
 
 `0003_mismatch_peers.sql` 为串件排查补充两个部分索引（仅覆盖 `result = 'MISMATCH'` 的行，分别以 `chip_binding_id` / `board_binding_id` 为前导列），让按绑定聚合不匹配核验只扫描触及目标绑定的记录。
 
+`0004_binding_inspections.sql` 为绑定核验历史补充两个普通索引（`(chip_binding_id, id)`、`(board_binding_id, id)`，覆盖全部判定结果），让按绑定倒序翻阅检查编号只扫描触及目标绑定的记录。
+
 ## API
 
 三个标识（`request_key`、`chip_uid`、`board_serial`）均为 1–64 位 ASCII 大写字母、数字或连字符；任一字段非法 → 整次 `422`，不入库。
@@ -177,6 +179,41 @@
 | 目标绑定不存在 | `404 NOT_FOUND` |
 | 数据库故障 | `500 INTERNAL` |
 
+### `GET /api/v1/bindings/{binding_id}/inspections?before_id=&limit=`
+
+返修主管复核一条绑定时，按时间倒序回放它**曾在哪些实物核验中被命中**——芯片侧命中、板卡侧命中或同一记录两侧都命中——每条都携带完整核验记录，而不是只看聚合结论。
+
+```json
+{
+  "binding": { "binding_id": 1, "request_key": "REQ-001", "chip_uid": "CHIP-9", "board_serial": "BOARD-7", "created_at": "..." },
+  "entries": [
+    {
+      "inspection": { "inspection_id": 42, "chip_uid": "CHIP-2", "board_serial": "BOARD-7", "result": "MISMATCH",
+                      "chip_binding_id": 2, "board_binding_id": 1, "created_at": "...",
+                      "chip_binding": { "binding_id": 2, "...": "..." },
+                      "board_binding": { "binding_id": 1, "...": "..." } },
+      "hit_side": "board"
+    }
+  ],
+  "next_cursor": 17
+}
+```
+
+- `entries[]` 每项是完整的核验记录（结构与 `GET /api/v1/inspections/{id}` 一致）外加 `hit_side`：`chip` / `board` / `both`。匹配只依据核验记录上**已保存的两侧绑定编号**（`chip_binding_id = X OR board_binding_id = X`），不按当前标识重新解析；四种判定结果的核验只要任一侧保存了目标绑定编号都会出现。
+- 一条核验两侧都保存目标绑定编号（即 `CONSISTENT` 自查）时只返回**一次**，`hit_side` 为 `both`，不会因 OR 命中两侧而重复。
+- 顺序固定为检查编号（`inspections.id`，不可变）严格倒序，`limit` 取 1–50，缺省 50。
+- 键集分页：首页不带 `before_id`；后续页把上一页返回的 `next_cursor` 原样作为 `before_id`（游标为该页最老一条的检查编号，**排他**上界）。末页 `next_cursor` 为 `null`；游标之前没有记录时 `entries` 为空数组 `[]` 且 `next_cursor` 为 `null`。游标不被消费，同一个 `before_id` 重复读取得到同一页。翻页期间新提交的核验编号更大，永远不会进入已固定在旧游标以下的页，因此连续翻页既不重复也不遗漏。
+- 整个查询在**同一个只读 REPEATABLE READ 事务**中完成（先确认目标绑定存在，再取一页），全程不产生任何写入——不写请求账本，也不写核验账本；`0004_binding_inspections.sql` 的两个索引支撑两侧编号的倒序扫描。
+- 响应始终携带目标绑定摘要 `binding`；目标绑定从无核验历史时 `entries` 为空数组 `[]`（仍返回 `200`）。
+
+| 情形 | 响应 |
+|---|---|
+| `binding_id` 非正整数（`0`、负数、小数、带符号、非数字） | `422 VALIDATION_FAILED`，`details.binding_id`，不查询数据库 |
+| `before_id` 非正整数（`0`、负数、小数、带符号、非数字、空值） | `422 VALIDATION_FAILED`，`details.before_id`，不查询数据库 |
+| `limit` 越界或非整数（`0`、`51`、`abc` 等） | `422 VALIDATION_FAILED`，`details.limit`，不查询数据库 |
+| 目标绑定不存在 | `404 NOT_FOUND`（即使同时带了非法 `before_id`，参数校验也先于存在性检查返回 422） |
+| 数据库故障 | `500 INTERNAL` |
+
 ## 运行（Docker Compose）
 
 ```bash
@@ -188,7 +225,7 @@ API_PORT=9090 docker compose up api    # API_PORT 覆盖宿主端口
 
 ## 验收
 
-`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝、重复字段整次拒绝（建档字段重复、核验扫描字段重复、批量查询项类型重复、顶层查询数组重复），以及返修实物核验的四种判定（同一绑定 `CONSISTENT`、交叉绑定 `MISMATCH`、单侧命中 `PARTIAL`、双侧未命中 `UNREGISTERED`）与复核/错误契约。每次运行使用唯一标识后缀，可重复执行。
+`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝、重复字段整次拒绝（建档字段重复、核验扫描字段重复、批量查询项类型重复、顶层查询数组重复），返修实物核验的四种判定（同一绑定 `CONSISTENT`、交叉绑定 `MISMATCH`、单侧命中 `PARTIAL`、双侧未命中 `UNREGISTERED`）与复核/错误契约，串件排查聚合视图，以及绑定核验历史（芯片侧/板卡侧/双侧命中只出现一次、检查编号倒序键集翻页无重复无遗漏、翻页期间新写入核验不影响旧游标、参数与存在性错误契约）。每次运行使用唯一标识后缀，可重复执行。
 
 ```bash
 docker compose up --build --exit-code-from verify

@@ -16,6 +16,7 @@ func NewRouter(h *Handler) *gin.Engine {
 	v1.GET("/bindings/by-chip-uid/:chip_uid", h.GetByChipUID)
 	v1.GET("/bindings/by-board-serial/:board_serial", h.GetByBoardSerial)
 	v1.GET("/bindings/:binding_id/mismatch-peers", h.GetMismatchPeers)
+	v1.GET("/bindings/:binding_id/inspections", h.GetBindingInspections)
 	v1.POST("/inspections", h.CreateInspection)
 	v1.GET("/inspections/:inspection_id", h.GetInspection)
 	return r

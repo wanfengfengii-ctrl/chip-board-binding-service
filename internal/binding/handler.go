@@ -292,10 +292,8 @@ func (h *Handler) CreateInspection(c *gin.Context) {
 // is queried); a legal id without a record is a 404.
 func (h *Handler) GetInspection(c *gin.Context) {
 	raw := c.Param("inspection_id")
-	// ParseInt keeps its range check, but it accepts a leading sign; a path id
-	// must be a canonical positive integer ("1", not "+1", "-1" or "01").
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 || raw[0] < '1' || raw[0] > '9' {
+	id, ok := parsePositiveID(raw)
+	if !ok {
 		writeError(c, http.StatusUnprocessableEntity, apiError{
 			Code:    CodeValidationFailed,
 			Message: "inspection_id must be a positive integer",
@@ -316,6 +314,18 @@ func (h *Handler) GetInspection(c *gin.Context) {
 	c.JSON(http.StatusOK, insp)
 }
 
+// parsePositiveID parses a canonical positive integer path/query parameter:
+// ParseInt keeps its range check, but it accepts a leading sign and leading
+// zeros, so a value whose first byte is not a digit 1-9 ("+1", "-1", "0",
+// "01") is rejected outright.
+func parsePositiveID(raw string) (int64, bool) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 || raw[0] < '1' || raw[0] > '9' {
+		return 0, false
+	}
+	return id, true
+}
+
 // GetMismatchPeers handles GET /api/v1/bindings/:binding_id/mismatch-peers. A
 // repair supervisor reviewing a suspected mix-up sees every other binding the
 // target was implicated with in mismatch inspections, most repeated first, so
@@ -325,9 +335,8 @@ func (h *Handler) GetInspection(c *gin.Context) {
 // a 404; a binding with no mismatch history yields an empty peers array.
 func (h *Handler) GetMismatchPeers(c *gin.Context) {
 	raw := c.Param("binding_id")
-	// Same canonical positive-integer rule as the inspection review path.
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 || raw[0] < '1' || raw[0] > '9' {
+	id, ok := parsePositiveID(raw)
+	if !ok {
 		writeError(c, http.StatusUnprocessableEntity, apiError{
 			Code:    CodeValidationFailed,
 			Message: "binding_id must be a positive integer",
@@ -360,6 +369,66 @@ func (h *Handler) GetMismatchPeers(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// GetBindingInspections handles GET /api/v1/bindings/:binding_id/inspections.
+// A repair supervisor reviewing one binding pages through the physical
+// verifications that ever hit it — on the chip side, the board side or both —
+// with the full record of each scan instead of an aggregate. Entries come back
+// newest inspection first; before_id carries the next_cursor of the previous
+// page and limit selects between one and fifty entries. Every parameter is
+// validated before the database is touched (422 with the offending field), a
+// legal id without a binding is a 404, and a cursor below every record yields
+// an empty entries array.
+func (h *Handler) GetBindingInspections(c *gin.Context) {
+	bindingID, ok := parsePositiveID(c.Param("binding_id"))
+	if !ok {
+		writeError(c, http.StatusUnprocessableEntity, apiError{
+			Code:    CodeValidationFailed,
+			Message: "binding_id must be a positive integer",
+			Details: map[string]string{"binding_id": "must be a positive integer"},
+		})
+		return
+	}
+
+	var beforeID *int64
+	if rawBefore, present := c.GetQuery("before_id"); present {
+		id, valid := parsePositiveID(rawBefore)
+		if !valid {
+			writeError(c, http.StatusUnprocessableEntity, apiError{
+				Code:    CodeValidationFailed,
+				Message: "before_id must be a positive integer",
+				Details: map[string]string{"before_id": "must be a positive integer"},
+			})
+			return
+		}
+		beforeID = &id
+	}
+
+	limit := DefaultInspectionHistoryLimit
+	if rawLimit, ok := c.GetQuery("limit"); ok {
+		n, perr := strconv.ParseInt(rawLimit, 10, 64)
+		if perr != nil || n < 1 || n > MaxInspectionHistoryLimit || rawLimit[0] < '1' || rawLimit[0] > '9' {
+			writeError(c, http.StatusUnprocessableEntity, apiError{
+				Code:    CodeValidationFailed,
+				Message: "limit must be an integer between 1 and 50",
+				Details: map[string]string{"limit": "must be an integer between 1 and 50"},
+			})
+			return
+		}
+		limit = int(n)
+	}
+
+	page, err := h.store.GetBindingInspections(c.Request.Context(), bindingID, beforeID, limit)
+	if errors.Is(err, ErrNotFound) {
+		writeError(c, http.StatusNotFound, apiError{Code: CodeNotFound, Message: "binding not found"})
+		return
+	}
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, apiError{Code: CodeInternal, Message: "internal error"})
+		return
+	}
+	c.JSON(http.StatusOK, page)
 }
 
 // unknownFieldName extracts the field name from a json "unknown field" error.

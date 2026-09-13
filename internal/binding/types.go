@@ -153,6 +153,47 @@ type Inspection struct {
 	BoardBinding   *Binding         `json:"board_binding,omitempty"`
 }
 
+// Binding-inspection-history bounds: a repair supervisor pages through at
+// most fifty physical verifications per request. DefaultInspectionHistoryLimit
+// applies when the query carries no limit.
+const (
+	DefaultInspectionHistoryLimit = 50
+	MaxInspectionHistoryLimit     = 50
+)
+
+// HitSide says on which side of a physical verification the queried binding
+// was recorded.
+type HitSide string
+
+const (
+	// HitSideChip means the binding was stored as the chip-side binding.
+	HitSideChip HitSide = "chip"
+	// HitSideBoard means the binding was stored as the board-side binding.
+	HitSideBoard HitSide = "board"
+	// HitSideBoth means the same record stored the binding on both sides;
+	// a CONSISTENT verification hits the binding exactly once, not twice.
+	HitSideBoth HitSide = "both"
+)
+
+// InspectionHit is one physical verification in a binding's history: the full
+// immutable inspection record together with the side (or both sides) on which
+// the queried binding was hit.
+type InspectionHit struct {
+	Inspection Inspection `json:"inspection"`
+	HitSide    HitSide    `json:"hit_side"`
+}
+
+// InspectionHistory is one page of a binding's physical-verification history.
+// Entries are ordered by inspection id descending and each entry appears at
+// most once even when both sides hit the same binding. NextCursor is the id to
+// pass as before_id for the following page; it is null on the last page.
+// Entries is empty — never null — when no record precedes the cursor.
+type InspectionHistory struct {
+	Binding    Binding         `json:"binding"`
+	Entries    []InspectionHit `json:"entries"`
+	NextCursor *int64          `json:"next_cursor"`
+}
+
 // ValidateInspectionRequest checks the two scanned identifiers with the same
 // 1-64 character identifier rule as every other endpoint.
 func ValidateInspectionRequest(req InspectionRequest) *ValidationError {
