@@ -313,6 +313,30 @@ func TestBatchValidationRejected(t *testing.T) {
 			body:          `{"queries":[42]}`,
 			wantLocations: []string{"queries[0]"},
 		},
+		"duplicate queries array": {
+			body:          `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-V"}],"queries":[{"line":2,"type":"board_serial","value":"BOARD-V"}]}`,
+			wantLocations: []string{"queries"},
+		},
+		"duplicate identical queries array": {
+			body:          `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-V"}],"queries":[{"line":1,"type":"chip_uid","value":"CHIP-V"}]}`,
+			wantLocations: []string{"queries"},
+		},
+		"duplicate type in item": {
+			body:          `{"queries":[{"line":1,"type":"chip_uid","type":"board_serial","value":"CHIP-V"}]}`,
+			wantLocations: []string{"queries[0].type"},
+		},
+		"duplicate line in item": {
+			body:          `{"queries":[{"line":1,"line":2,"type":"chip_uid","value":"CHIP-V"}]}`,
+			wantLocations: []string{"queries[0].line"},
+		},
+		"duplicate value in item": {
+			body:          `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-V","value":"CHIP-OTHER"}]}`,
+			wantLocations: []string{"queries[0].value"},
+		},
+		"duplicate unknown key in item": {
+			body:          `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-V","extra":1,"extra":2}]}`,
+			wantLocations: []string{"queries[0].extra"},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -342,6 +366,71 @@ func TestBatchValidationRejected(t *testing.T) {
 	assert.Equal(t, "queries[0].value", errBody.Error.FieldErrors[0].Location)
 	assert.Equal(t, "queries[1].type", errBody.Error.FieldErrors[1].Location)
 	assert.Equal(t, "queries[1].value", errBody.Error.FieldErrors[2].Location)
+	env.assertCounts(t, 1, 1)
+}
+
+// TestBatchDuplicateKeysRejected pins the ambiguous-batch rule. encoding/json
+// would silently keep the last occurrence of a repeated member: a second
+// queries array would replace the first group, and a repeated type/line/value
+// in one item would take the last value. Such structurally or semantically
+// ambiguous requests must be rejected wholesale with 422 at the exact field
+// position, and never reach the database.
+func TestBatchDuplicateKeysRejected(t *testing.T) {
+	env := newTestEnv(t)
+	env.mustCreate(t, "REQ-DK", "CHIP-DK", "BOARD-DK")
+
+	cases := map[string]struct {
+		body string
+		loc  string
+	}{
+		"second queries array replaces the first": {
+			body: `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK"}],"queries":[{"line":2,"type":"board_serial","value":"BOARD-DK"}]}`,
+			loc:  "queries",
+		},
+		"identical queries arrays still ambiguous": {
+			body: `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK"}],"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK"}]}`,
+			loc:  "queries",
+		},
+		"repeated type takes last": {
+			body: `{"queries":[{"line":1,"type":"chip_uid","type":"board_serial","value":"CHIP-DK"}]}`,
+			loc:  "queries[0].type",
+		},
+		"repeated line takes last": {
+			body: `{"queries":[{"line":1,"line":2,"type":"chip_uid","value":"CHIP-DK"}]}`,
+			loc:  "queries[0].line",
+		},
+		"repeated value takes last": {
+			body: `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK","value":"BOARD-DK"}]}`,
+			loc:  "queries[0].value",
+		},
+		"duplicate key after a good item": {
+			body: `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK"},{"line":2,"line":3,"type":"board_serial","value":"BOARD-DK"}]}`,
+			loc:  "queries[1].line",
+		},
+		"last type alone would be valid": {
+			body: `{"queries":[{"line":1,"type":"nope","type":"chip_uid","value":"CHIP-DK"}]}`,
+			loc:  "queries[0].type",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, raw := env.batch(t, tc.body)
+			require.Equal(t, http.StatusUnprocessableEntity, status, string(raw))
+			errBody := parseBatchError(t, raw)
+			assert.Equal(t, "VALIDATION_FAILED", errBody.Error.Code)
+			require.Len(t, errBody.Error.FieldErrors, 1, string(raw))
+			assert.Equal(t, tc.loc, errBody.Error.FieldErrors[0].Location, string(raw))
+		})
+	}
+
+	// A trailing second JSON value next to a complete envelope is rejected too.
+	status, raw := env.batch(t, `{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-DK"}]}{}`)
+	require.Equal(t, http.StatusUnprocessableEntity, status, string(raw))
+	errBody := parseBatchError(t, raw)
+	assert.Equal(t, "VALIDATION_FAILED", errBody.Error.Code)
+	assert.Equal(t, "", errBody.Error.FieldErrors[0].Location)
+
+	// Rejected batches are read-only anyway; confirm nothing was written.
 	env.assertCounts(t, 1, 1)
 }
 

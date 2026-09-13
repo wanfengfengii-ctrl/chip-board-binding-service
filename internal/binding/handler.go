@@ -47,20 +47,8 @@ func NewHandler(store *Store) *Handler { return &Handler{store: store} }
 // Create handles POST /api/v1/bindings.
 func (h *Handler) Create(c *gin.Context) {
 	var req CreateRequest
-	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(c, http.StatusUnprocessableEntity, apiError{
-			Code:    CodeValidationFailed,
-			Message: "body must be a JSON object with request_key, chip_uid and board_serial string fields",
-		})
-		return
-	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(c, http.StatusUnprocessableEntity, apiError{
-			Code:    CodeValidationFailed,
-			Message: "body must contain exactly one JSON object",
-		})
+	if err := decodeUniqueObject(http.MaxBytesReader(c.Writer, c.Request.Body, 4096), &req); err != nil {
+		h.writeCreateDecodeError(c, err)
 		return
 	}
 	if verr := ValidateCreateRequest(req); verr != nil {
@@ -165,22 +153,29 @@ func (h *Handler) BatchLookup(c *gin.Context) {
 		return
 	}
 
-	// First decode only the envelope, rejecting trailing data, unknown
-	// top-level fields or a non-array queries value.
+	// First decode only the envelope, rejecting trailing data, a repeated
+	// top-level key (a second "queries" would otherwise silently replace the
+	// first array), unknown top-level fields or a non-array queries value.
 	var envelope struct {
 		Queries []json.RawMessage `json:"queries"`
 	}
-	dec := json.NewDecoder(strings.NewReader(string(body)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&envelope); err != nil {
-		// A wrong-typed queries value pinpoints "queries"; every other
-		// malformed-envelope error concerns the whole body.
+	if err := decodeUniqueJSON(body, &envelope, true); err != nil {
+		// A wrong-typed queries value pinpoints "queries"; a repeated queries
+		// key pinpoints it too; every other malformed-envelope error concerns
+		// the whole body.
 		location := ""
 		message := "body must be a JSON object with a queries array of {line,type,value} items"
 		var typeErr *json.UnmarshalTypeError
-		if errors.As(err, &typeErr) && typeErr.Field != "" {
+		var dupErr *duplicateKeyError
+		switch {
+		case errors.As(err, &typeErr) && typeErr.Field != "":
 			location = strings.ToLower(typeErr.Field)
 			message = fmt.Sprintf("%s has the wrong JSON type", location)
+		case errors.As(err, &dupErr):
+			location = dupErr.Key
+			message = fmt.Sprintf("%s appears more than once; the request structure must be unambiguous", dupErr.Key)
+		case errors.Is(err, errMultipleJSONValues):
+			message = "body must contain exactly one JSON object"
 		}
 		writeError(c, http.StatusUnprocessableEntity, apiError{
 			Code:        CodeValidationFailed,
@@ -189,28 +184,21 @@ func (h *Handler) BatchLookup(c *gin.Context) {
 		})
 		return
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(c, http.StatusUnprocessableEntity, apiError{
-			Code:        CodeValidationFailed,
-			Message:     "body must contain exactly one JSON object",
-			FieldErrors: []FieldError{{Location: "", Message: "body must contain exactly one JSON object"}},
-		})
-		return
-	}
 
-	// Decode each item on its own so a wrong field type or unknown field can
-	// be pinned to its exact array position.
+	// Decode each item on its own so a wrong field type, an unknown field or a
+	// repeated member name can be pinned to its exact array position.
 	req := BatchQueryRequest{Queries: make([]BatchQueryItem, len(envelope.Queries))}
 	var fieldErrs []FieldError
 	for i, raw := range envelope.Queries {
 		var item BatchQueryItem
-		itemDec := json.NewDecoder(strings.NewReader(string(raw)))
-		itemDec.DisallowUnknownFields()
-		if err := itemDec.Decode(&item); err != nil {
+		err := decodeUniqueJSON(raw, &item, false)
+		if err != nil {
 			location := fmt.Sprintf("queries[%d]", i)
 			message := err.Error()
 			var typeErr *json.UnmarshalTypeError
-			if errors.As(err, &typeErr) {
+			var dupErr *duplicateKeyError
+			switch {
+			case errors.As(err, &typeErr):
 				if typeErr.Field != "" {
 					// The decoder reports the bare struct field ("line");
 					// prefix it with the item position.
@@ -222,17 +210,21 @@ func (h *Handler) BatchLookup(c *gin.Context) {
 					location = fmt.Sprintf("queries[%d]", i)
 					message = "query item must be a JSON object"
 				}
-			} else if name, ok := unknownFieldName(err); ok {
-				location = fmt.Sprintf("queries[%d].%s", i, name)
+			case errors.As(err, &dupErr):
+				// A repeated line/type/value is ambiguous: encoding/json would
+				// keep the last occurrence, so the whole batch is rejected.
+				location = fmt.Sprintf("queries[%d].%s", i, dupErr.Key)
+				message = fmt.Sprintf("%s appears more than once; the query must be unambiguous", dupErr.Key)
+			case errors.Is(err, errMultipleJSONValues):
+				location = fmt.Sprintf("queries[%d]", i)
+				message = "each query must be exactly one JSON object"
+			}
+			if typeErr == nil && dupErr == nil && !errors.Is(err, errMultipleJSONValues) {
+				if name, ok := unknownFieldName(err); ok {
+					location = fmt.Sprintf("queries[%d].%s", i, name)
+				}
 			}
 			fieldErrs = append(fieldErrs, FieldError{Location: location, Message: message})
-			continue
-		}
-		if err := itemDec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-			fieldErrs = append(fieldErrs, FieldError{
-				Location: fmt.Sprintf("queries[%d]", i),
-				Message:  "each query must be exactly one JSON object",
-			})
 			continue
 		}
 		req.Queries[i] = item
@@ -273,20 +265,8 @@ func (h *Handler) BatchLookup(c *gin.Context) {
 // with 422 and nothing is stored.
 func (h *Handler) CreateInspection(c *gin.Context) {
 	var req InspectionRequest
-	dec := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		writeError(c, http.StatusUnprocessableEntity, apiError{
-			Code:    CodeValidationFailed,
-			Message: "body must be a JSON object with chip_uid and board_serial string fields",
-		})
-		return
-	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(c, http.StatusUnprocessableEntity, apiError{
-			Code:    CodeValidationFailed,
-			Message: "body must contain exactly one JSON object",
-		})
+	if err := decodeUniqueObject(http.MaxBytesReader(c.Writer, c.Request.Body, 4096), &req); err != nil {
+		h.writeInspectionDecodeError(c, err)
 		return
 	}
 	if verr := ValidateInspectionRequest(req); verr != nil {
@@ -401,6 +381,48 @@ func (h *Handler) Health(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// writeCreateDecodeError maps a request-body decode failure of the binding
+// create endpoint to its 422 envelope. A repeated member name pinpoints the
+// ambiguous field; every other malformed-body error keeps the generic message.
+func (h *Handler) writeCreateDecodeError(c *gin.Context, err error) {
+	message := "body must be a JSON object with request_key, chip_uid and board_serial string fields"
+	var details map[string]string
+	var dupErr *duplicateKeyError
+	switch {
+	case errors.As(err, &dupErr):
+		message = fmt.Sprintf("field %s appears more than once; every field must carry a single unambiguous value", dupErr.Key)
+		details = map[string]string{dupErr.Key: "must appear at most once"}
+	case errors.Is(err, errMultipleJSONValues):
+		message = "body must contain exactly one JSON object"
+	}
+	writeError(c, http.StatusUnprocessableEntity, apiError{
+		Code:    CodeValidationFailed,
+		Message: message,
+		Details: details,
+	})
+}
+
+// writeInspectionDecodeError is the inspection-create counterpart of
+// writeCreateDecodeError: a repeated scan field makes the verdict ambiguous, so
+// the whole request is rejected before any value is used.
+func (h *Handler) writeInspectionDecodeError(c *gin.Context, err error) {
+	message := "body must be a JSON object with chip_uid and board_serial string fields"
+	var details map[string]string
+	var dupErr *duplicateKeyError
+	switch {
+	case errors.As(err, &dupErr):
+		message = fmt.Sprintf("field %s appears more than once; every scanned field must carry a single unambiguous value", dupErr.Key)
+		details = map[string]string{dupErr.Key: "must appear at most once"}
+	case errors.Is(err, errMultipleJSONValues):
+		message = "body must contain exactly one JSON object"
+	}
+	writeError(c, http.StatusUnprocessableEntity, apiError{
+		Code:    CodeValidationFailed,
+		Message: message,
+		Details: details,
+	})
 }
 
 func writeError(c *gin.Context, status int, e apiError) {

@@ -48,9 +48,10 @@ type inspection struct {
 
 type errorEnvelope struct {
 	Error struct {
-		Code        string       `json:"code"`
-		Field       string       `json:"field"`
-		FieldErrors []fieldError `json:"field_errors"`
+		Code        string            `json:"code"`
+		Field       string            `json:"field"`
+		Details     map[string]string `json:"details"`
+		FieldErrors []fieldError      `json:"field_errors"`
 	} `json:"error"`
 }
 
@@ -160,6 +161,7 @@ func main() {
 	v.scenarioInspectionVerdicts()
 	v.scenarioInspectionReviewAndErrors()
 	v.scenarioMismatchPeers()
+	v.scenarioDuplicateFieldsRejected()
 
 	fmt.Println()
 	if v.failures > 0 {
@@ -835,6 +837,98 @@ func (v *verifier) scenarioMismatchPeers() {
 	review := v.getInspection(mAB2.inspection.InspectionID)
 	v.check(review.status == http.StatusOK && inspectionsEqual(review.inspection, mAB2.inspection),
 		"inspection review unchanged alongside mismatch-peers")
+}
+
+// scenarioDuplicateFieldsRejected covers the ambiguous-payload rule shared by
+// every write/parse entry point: a JSON object that names the same member
+// twice leaves its meaning to "last value wins", so the service must reject
+// the whole request with 422 instead of filing or resolving any of the
+// conflicting values. The four cases are a repeated binding field, a repeated
+// scan field, a repeated query type in one batch item, and a repeated top-level
+// queries array.
+func (v *verifier) scenarioDuplicateFieldsRejected() {
+	fmt.Println("scenario: duplicate json fields rejected wholesale, last value never wins")
+	run := v.run
+
+	// A valid binding is set up so an ambiguous scan/query would have resolved
+	// if the last value had silently won.
+	setup := v.create("REQ-"+run+"-DUP", "CHIP-"+run+"-DUP", "BOARD-"+run+"-DUP")
+	v.check(setup.status == http.StatusCreated, "setup create returns 201 (got %d: %s)", setup.status, setup.raw)
+
+	type createCase struct {
+		name  string
+		body  string
+		field string
+	}
+	createCases := []createCase{
+		{"duplicate request key",
+			`{"request_key":"REQ-` + run + `-DUP-K1","request_key":"REQ-` + run + `-DUP-K2","chip_uid":"CHIP-` + run + `-NEW1","board_serial":"BOARD-` + run + `-NEW1"}`,
+			"request_key"},
+		{"duplicate chip uid",
+			`{"request_key":"REQ-` + run + `-DUP-C","chip_uid":"CHIP-` + run + `-NEW2","chip_uid":"CHIP-` + run + `-DUP","board_serial":"BOARD-` + run + `-NEW2"}`,
+			"chip_uid"},
+		{"duplicate board serial",
+			`{"request_key":"REQ-` + run + `-DUP-B","chip_uid":"CHIP-` + run + `-NEW3","board_serial":"BOARD-` + run + `-NEW3","board_serial":"BOARD-` + run + `-DUP"}`,
+			"board_serial"},
+		{"identical values are still ambiguous",
+			`{"request_key":"REQ-` + run + `-DUP-S","request_key":"REQ-` + run + `-DUP-S","chip_uid":"CHIP-` + run + `-NEW4","board_serial":"BOARD-` + run + `-NEW4"}`,
+			"request_key"},
+	}
+	for _, tc := range createCases {
+		resp := v.do(http.MethodPost, "/api/v1/bindings", []byte(tc.body))
+		v.check(resp.status == http.StatusUnprocessableEntity && resp.errBody.Error.Code == codeValidationFailed &&
+			resp.errBody.Error.Details[tc.field] != "",
+			"%s: 422 VALIDATION_FAILED naming %s (got %d: %s)", tc.name, tc.field, resp.status, resp.raw)
+	}
+	// Neither conflicting value of a rejected create may be filed.
+	for _, key := range []string{"REQ-" + run + "-DUP-K1", "REQ-" + run + "-DUP-K2", "REQ-" + run + "-DUP-C", "REQ-" + run + "-DUP-B", "REQ-" + run + "-DUP-S"} {
+		lookup := v.get("/api/v1/bindings/by-request-key/" + key)
+		v.check(lookup.status == http.StatusNotFound, "rejected ambiguous key %s is not stored", key)
+	}
+
+	// Physical verification: a repeated scanned field would judge against the
+	// last scan; the request must be rejected and no verdict stored.
+	inspectCases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"duplicate chip scan",
+			`{"chip_uid":"CHIP-` + run + `-GHOST","chip_uid":"CHIP-` + run + `-DUP","board_serial":"BOARD-` + run + `-DUP"}`,
+			"chip_uid"},
+		{"duplicate board scan",
+			`{"chip_uid":"CHIP-` + run + `-DUP","board_serial":"BOARD-` + run + `-GHOST","board_serial":"BOARD-` + run + `-DUP"}`,
+			"board_serial"},
+	}
+	for _, tc := range inspectCases {
+		resp := v.inspectRaw(tc.body)
+		v.check(resp.status == http.StatusUnprocessableEntity && resp.errBody.Error.Code == codeValidationFailed &&
+			resp.errBody.Error.Details[tc.field] != "",
+			"%s: 422 VALIDATION_FAILED naming %s (got %d: %s)", tc.name, tc.field, resp.status, resp.raw)
+	}
+	// A normal scan of the same values still works, proving the rejected
+	// payloads neither created a verdict nor poisoned the pair.
+	clean := v.inspect("CHIP-"+run+"-DUP", "BOARD-"+run+"-DUP")
+	v.check(clean.status == http.StatusCreated && clean.inspection.Result == "CONSISTENT",
+		"unambiguous scan after rejections still judges CONSISTENT (got %d: %s)", clean.status, clean.raw)
+
+	// Batch: a repeated type within one item would execute the last type.
+	badType := v.batchRaw(`{"queries":[{"line":1,"type":"board_serial","type":"chip_uid","value":"CHIP-` + run + `-DUP"}]}`)
+	v.check(badType.status == http.StatusUnprocessableEntity && badType.errBody.Error.Code == codeValidationFailed &&
+		len(badType.errBody.Error.FieldErrors) == 1 && badType.errBody.Error.FieldErrors[0].Location == "queries[0].type",
+		"repeated query type: 422 at queries[0].type (got %d: %s)", badType.status, badType.raw)
+
+	// Batch: a repeated top-level queries array would drop the first group.
+	badEnvelope := v.batchRaw(`{"queries":[{"line":1,"type":"chip_uid","value":"CHIP-` + run + `-DUP"}],` +
+		`"queries":[{"line":2,"type":"board_serial","value":"BOARD-` + run + `-DUP"}]}`)
+	v.check(badEnvelope.status == http.StatusUnprocessableEntity && badEnvelope.errBody.Error.Code == codeValidationFailed &&
+		len(badEnvelope.errBody.Error.FieldErrors) == 1 && badEnvelope.errBody.Error.FieldErrors[0].Location == "queries",
+		"repeated queries array: 422 at queries (got %d: %s)", badEnvelope.status, badEnvelope.raw)
+
+	// An unambiguous batch on the same identifiers still resolves normally.
+	good := v.batch([]batchQuery{{Line: 1, Type: "chip_uid", Value: "CHIP-" + run + "-DUP"}})
+	v.check(good.status == http.StatusOK && len(good.results) == 1 && good.results[0].Status == "FOUND",
+		"unambiguous batch after rejections still resolves FOUND (got %d: %s)", good.status, good.raw)
 }
 
 // inspectionsEqual compares two inspection records deeply: the embedded

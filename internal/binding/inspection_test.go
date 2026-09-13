@@ -197,20 +197,23 @@ func TestInspectionValidationRejected(t *testing.T) {
 	env := newTestEnv(t)
 
 	cases := map[string]string{
-		"lowercase chip uid":    `{"chip_uid":"chip-1","board_serial":"BOARD-1"}`,
-		"underscore board":      `{"chip_uid":"CHIP-1","board_serial":"BOARD_1"}`,
-		"non-ascii chip uid":    `{"chip_uid":"CHIP-é","board_serial":"BOARD-1"}`,
-		"empty chip uid":        `{"chip_uid":"","board_serial":"BOARD-1"}`,
-		"missing board serial":  `{"chip_uid":"CHIP-1"}`,
-		"missing chip uid":      `{"board_serial":"BOARD-1"}`,
-		"empty object":          `{}`,
-		"overlong board serial": `{"chip_uid":"CHIP-1","board_serial":"` + strings.Repeat("B", 65) + `"}`,
-		"malformed json":        `{"chip_uid":`,
-		"wrong field type":      `{"chip_uid":42,"board_serial":"BOARD-1"}`,
-		"null chip uid":         `{"chip_uid":null,"board_serial":"BOARD-1"}`,
-		"unknown field":         `{"chip_uid":"CHIP-1","board_serial":"BOARD-1","extra":1}`,
-		"empty body":            ``,
-		"trailing json garbage": `{"chip_uid":"CHIP-1","board_serial":"BOARD-1"}{}`,
+		"lowercase chip uid":       `{"chip_uid":"chip-1","board_serial":"BOARD-1"}`,
+		"underscore board":         `{"chip_uid":"CHIP-1","board_serial":"BOARD_1"}`,
+		"non-ascii chip uid":       `{"chip_uid":"CHIP-é","board_serial":"BOARD-1"}`,
+		"empty chip uid":           `{"chip_uid":"","board_serial":"BOARD-1"}`,
+		"missing board serial":     `{"chip_uid":"CHIP-1"}`,
+		"missing chip uid":         `{"board_serial":"BOARD-1"}`,
+		"empty object":             `{}`,
+		"overlong board serial":    `{"chip_uid":"CHIP-1","board_serial":"` + strings.Repeat("B", 65) + `"}`,
+		"malformed json":           `{"chip_uid":`,
+		"wrong field type":         `{"chip_uid":42,"board_serial":"BOARD-1"}`,
+		"null chip uid":            `{"chip_uid":null,"board_serial":"BOARD-1"}`,
+		"unknown field":            `{"chip_uid":"CHIP-1","board_serial":"BOARD-1","extra":1}`,
+		"empty body":               ``,
+		"trailing json garbage":    `{"chip_uid":"CHIP-1","board_serial":"BOARD-1"}{}`,
+		"duplicate chip uid":       `{"chip_uid":"CHIP-1","chip_uid":"CHIP-2","board_serial":"BOARD-1"}`,
+		"duplicate board serial":   `{"chip_uid":"CHIP-1","board_serial":"BOARD-1","board_serial":"BOARD-2"}`,
+		"duplicate identical scan": `{"chip_uid":"CHIP-1","board_serial":"BOARD-1","board_serial":"BOARD-1"}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -223,6 +226,51 @@ func TestInspectionValidationRejected(t *testing.T) {
 
 	// Nothing invalid ever reaches the inspections table, and no bindings are
 	// needed to reject it.
+	env.assertInspectionCount(t, 0)
+}
+
+// TestInspectionDuplicateScanFieldsRejected pins the ambiguous-scan rule:
+// submitting chip_uid or board_serial more than once would otherwise make the
+// verdict resolve against the last scanned value. The whole request must be
+// rejected with 422 pinpointing the repeated field, and no verdict stored —
+// even when both values, or just the last one alone, would be legal scans.
+func TestInspectionDuplicateScanFieldsRejected(t *testing.T) {
+	env := newTestEnv(t)
+	status, _ := env.mustCreate(t, "REQ-IDUP", "CHIP-IDUP", "BOARD-IDUP")
+	require.Equal(t, http.StatusCreated, status)
+
+	cases := map[string]struct {
+		body  string
+		field string
+	}{
+		"duplicate chip uid": {
+			body:  `{"chip_uid":"CHIP-IDUP","chip_uid":"CHIP-OTHER","board_serial":"BOARD-IDUP"}`,
+			field: "chip_uid",
+		},
+		"duplicate board serial": {
+			body:  `{"chip_uid":"CHIP-IDUP","board_serial":"BOARD-IDUP","board_serial":"BOARD-OTHER"}`,
+			field: "board_serial",
+		},
+		"identical scans still ambiguous": {
+			body:  `{"chip_uid":"CHIP-IDUP","board_serial":"BOARD-IDUP","chip_uid":"CHIP-IDUP"}`,
+			field: "chip_uid",
+		},
+		"last value alone would judge CONSISTENT": {
+			body:  `{"chip_uid":"chip-bad","chip_uid":"CHIP-IDUP","board_serial":"BOARD-IDUP"}`,
+			field: "chip_uid",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, raw, err := env.inspectRaw(tc.body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusUnprocessableEntity, status, string(raw))
+			errBody := parseError(t, raw)
+			assert.Equal(t, "VALIDATION_FAILED", errBody.Error.Code)
+			assert.Contains(t, errBody.Error.Details, tc.field, string(raw))
+		})
+	}
+
 	env.assertInspectionCount(t, 0)
 }
 

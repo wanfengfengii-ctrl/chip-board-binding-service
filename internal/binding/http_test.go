@@ -204,16 +204,20 @@ func TestValidationRejected(t *testing.T) {
 	env := newTestEnv(t)
 
 	bodies := map[string]string{
-		"lowercase chip uid":     `{"request_key":"REQ-V1","chip_uid":"chip-1","board_serial":"BOARD-1"}`,
-		"underscore in chip uid": `{"request_key":"REQ-V2","chip_uid":"CHIP_1","board_serial":"BOARD-1"}`,
-		"non-ascii board serial": `{"request_key":"REQ-V3","chip_uid":"CHIP-1","board_serial":"BOARD-é"}`,
-		"empty board serial":     `{"request_key":"REQ-V4","chip_uid":"CHIP-1","board_serial":""}`,
-		"overlong request key":   `{"request_key":"` + strings.Repeat("K", 65) + `","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
-		"missing board serial":   `{"request_key":"REQ-V6","chip_uid":"CHIP-1"}`,
-		"malformed json":         `{"request_key":`,
-		"wrong field type":       `{"request_key":"REQ-V8","chip_uid":42,"board_serial":"BOARD-1"}`,
-		"unknown field":          `{"request_key":"REQ-V9","chip_uid":"CHIP-1","board_serial":"BOARD-1","extra":"x"}`,
-		"empty body":             ``,
+		"lowercase chip uid":      `{"request_key":"REQ-V1","chip_uid":"chip-1","board_serial":"BOARD-1"}`,
+		"underscore in chip uid":  `{"request_key":"REQ-V2","chip_uid":"CHIP_1","board_serial":"BOARD-1"}`,
+		"non-ascii board serial":  `{"request_key":"REQ-V3","chip_uid":"CHIP-1","board_serial":"BOARD-é"}`,
+		"empty board serial":      `{"request_key":"REQ-V4","chip_uid":"CHIP-1","board_serial":""}`,
+		"overlong request key":    `{"request_key":"` + strings.Repeat("K", 65) + `","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
+		"missing board serial":    `{"request_key":"REQ-V6","chip_uid":"CHIP-1"}`,
+		"malformed json":          `{"request_key":`,
+		"wrong field type":        `{"request_key":"REQ-V8","chip_uid":42,"board_serial":"BOARD-1"}`,
+		"unknown field":           `{"request_key":"REQ-V9","chip_uid":"CHIP-1","board_serial":"BOARD-1","extra":"x"}`,
+		"empty body":              ``,
+		"duplicate request key":   `{"request_key":"REQ-DUP-1","request_key":"REQ-DUP-2","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
+		"duplicate chip uid":      `{"request_key":"REQ-DUP-3","chip_uid":"CHIP-1","chip_uid":"CHIP-2","board_serial":"BOARD-1"}`,
+		"duplicate board serial":  `{"request_key":"REQ-DUP-4","chip_uid":"CHIP-1","board_serial":"BOARD-1","board_serial":"BOARD-2"}`,
+		"duplicate identical key": `{"request_key":"REQ-DUP-5","request_key":"REQ-DUP-5","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
 	}
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
@@ -224,6 +228,58 @@ func TestValidationRejected(t *testing.T) {
 	}
 
 	// The whole request is rejected: nothing reaches the database.
+	env.assertCounts(t, 0, 0)
+}
+
+// TestCreateDuplicateFieldsRejected pins the ambiguous-payload rule: when the
+// create body names any field more than once, encoding/json would otherwise
+// silently keep the last value and archive the binding under it. The service
+// must reject the whole request with 422, pinpoint the repeated field, and
+// store nothing — even when both values or just the last one are legal
+// identifiers.
+func TestCreateDuplicateFieldsRejected(t *testing.T) {
+	env := newTestEnv(t)
+
+	cases := map[string]struct {
+		body  string
+		field string
+	}{
+		"duplicate request key": {
+			body:  `{"request_key":"REQ-DUP-A1","request_key":"REQ-DUP-A2","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
+			field: "request_key",
+		},
+		"duplicate chip uid": {
+			body:  `{"request_key":"REQ-DUP-B","chip_uid":"CHIP-1","chip_uid":"CHIP-2","board_serial":"BOARD-1"}`,
+			field: "chip_uid",
+		},
+		"duplicate board serial": {
+			body:  `{"request_key":"REQ-DUP-C","chip_uid":"CHIP-1","board_serial":"BOARD-1","board_serial":"BOARD-2"}`,
+			field: "board_serial",
+		},
+		"identical values still ambiguous": {
+			body:  `{"request_key":"REQ-DUP-D","request_key":"REQ-DUP-D","chip_uid":"CHIP-1","board_serial":"BOARD-1"}`,
+			field: "request_key",
+		},
+		"last value alone would be legal": {
+			body:  `{"request_key":"REQ-DUP-E","chip_uid":"chip-bad","chip_uid":"CHIP-GOOD","board_serial":"BOARD-1"}`,
+			field: "chip_uid",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			status, raw := env.postBody(t, tc.body)
+			require.Equal(t, http.StatusUnprocessableEntity, status, string(raw))
+			errBody := parseError(t, raw)
+			assert.Equal(t, "VALIDATION_FAILED", errBody.Error.Code)
+			assert.Contains(t, errBody.Error.Details, tc.field, string(raw))
+		})
+	}
+
+	// Neither the first nor the last value of a rejected payload may be filed.
+	for _, id := range []string{"REQ-DUP-A1", "REQ-DUP-A2", "REQ-DUP-B", "REQ-DUP-C", "REQ-DUP-D", "REQ-DUP-E"} {
+		status, _ := env.get(t, "/api/v1/bindings/by-request-key/"+id)
+		assert.Equal(t, http.StatusNotFound, status, id)
+	}
 	env.assertCounts(t, 0, 0)
 }
 

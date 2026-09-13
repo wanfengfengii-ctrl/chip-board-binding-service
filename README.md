@@ -29,6 +29,8 @@
 
 三个标识（`request_key`、`chip_uid`、`board_serial`）均为 1–64 位 ASCII 大写字母、数字或连字符；任一字段非法 → 整次 `422`，不入库。
 
+所有 JSON 请求体还遵循一条**字段唯一性**规则：同一对象内每个成员名只能出现一次（即使两次取值完全相同）。Go 默认的 JSON 解码对重复键采用“末次值覆盖”，会让字段含义不唯一；服务在解码前先做流式校验，发现重复成员即整次拒绝（`422 VALIDATION_FAILED`），不会使用任何一个冲突值建档或判定。请求体包含两个并列 JSON 值（`}{` 拼接）同样整次拒绝。
+
 ### `POST /api/v1/bindings`
 
 ```json
@@ -40,7 +42,7 @@
 | `201` | 新建成功，返回绑定记录 |
 | `200` | 同键同载荷重放，返回原始记录（与首次响应逐字节一致） |
 | `409` | `REQUEST_KEY_CONFLICT`（同键不同载荷，附 `existing` 原始记录）或 `DEVICE_ALREADY_BOUND`（器件已占用，附 `field`） |
-| `422` | 校验失败，整次拒绝 |
+| `422` | 校验失败，整次拒绝；请求体重复携带任一字段（`request_key` / `chip_uid` / `board_serial`，即使值相同）同样整次拒绝，`error.details` 标出重复字段 |
 
 ### 查询（未找到统一 `404 NOT_FOUND`）
 
@@ -84,9 +86,11 @@
 | 非法情形 | 位置 |
 |---|---|
 | `queries` 为空数组/缺失 | `queries` |
+| 顶层重复携带 `queries`（结构不唯一，即使两组内容相同） | `queries` |
 | 超过 100 项 | `queries` |
 | 行号缺失、非正整数、重复 | `queries[i].line` |
 | 未知查询类型 | `queries[i].type` |
+| 单个查询项重复携带任一字段（`line` / `type` / `value`，语义不明确） | `queries[i].<字段>` |
 | 非法标识 | `queries[i].value` |
 
 ### `GET /healthz`
@@ -103,7 +107,7 @@
 { "chip_uid": "CHIP-9", "board_serial": "BOARD-7" }
 ```
 
-两个标识适用同样的 1–64 位标识规则；非法标识整次 `422 VALIDATION_FAILED`，不落库。事务先在同一快照中解析两侧命中的绑定（一条 SQL 的两个 LATERAL 子查询），再按命中关系写入核验记录：
+两个标识适用同样的 1–64 位标识规则；非法标识整次 `422 VALIDATION_FAILED`，不落库。请求体重复携带 `chip_uid` 或 `board_serial`（即使两次扫描值相同）同样整次 `422 VALIDATION_FAILED`，`error.details` 标出重复字段——不能按末次扫描值保存判定。事务先在同一快照中解析两侧命中的绑定（一条 SQL 的两个 LATERAL 子查询），再按命中关系写入核验记录：
 
 | 判定 | 条件 |
 |---|---|
@@ -184,7 +188,7 @@ API_PORT=9090 docker compose up api    # API_PORT 覆盖宿主端口
 
 ## 验收
 
-`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝，以及返修实物核验的四种判定（同一绑定 `CONSISTENT`、交叉绑定 `MISMATCH`、单侧命中 `PARTIAL`、双侧未命中 `UNREGISTERED`）与复核/错误契约。每次运行使用唯一标识后缀，可重复执行。
+`verify` 是一次性验收服务，模拟产线真实故障模式：首次成功后响应丢失并重放、两个工位同时争用同一芯片/板卡、同键重放竞速、同键异载荷竞速、非法输入拒绝、重复字段整次拒绝（建档字段重复、核验扫描字段重复、批量查询项类型重复、顶层查询数组重复），以及返修实物核验的四种判定（同一绑定 `CONSISTENT`、交叉绑定 `MISMATCH`、单侧命中 `PARTIAL`、双侧未命中 `UNREGISTERED`）与复核/错误契约。每次运行使用唯一标识后缀，可重复执行。
 
 ```bash
 docker compose up --build --exit-code-from verify
